@@ -692,10 +692,17 @@ export function loadStoredData(): {
       const storedConfig = localStorage.getItem(STORAGE_KEY_CONFIG);
       if (storedConfig) {
         const parsed = JSON.parse(storedConfig);
+        // Merge stored config but preserve the new default sheetUrl/sheetId if not set
         config = { ...config, ...parsed, pollIntervalSec: 2 };
-        if (config.gasWebAppUrl) {
+        // Normalize mode: if user explicitly chose 'simulator', keep it;
+        // if localStorage has a gasWebAppUrl AND mode=gas_live, keep gas_live;
+        // otherwise always fall back to sheet_direct with the configured sheetUrl.
+        if (parsed.mode === 'simulator') {
+          config.mode = 'simulator';
+        } else if (parsed.mode === 'gas_live' && config.gasWebAppUrl) {
           config.mode = 'gas_live';
-        } else if (config.sheetUrl || defaultSheetUrl) {
+        } else {
+          // Default / fallback: use sheet_direct
           config.sheetUrl = config.sheetUrl || defaultSheetUrl;
           config.mode = 'sheet_direct';
         }
@@ -1087,7 +1094,115 @@ export async function fetchFromGoogleSheetUrl(
     }
   });
 
-  return { trucks, priorityTrucks, history: [], hasPrioritySupport: true };
+  // Fetch history sheet in parallel (best-effort, never throws)
+  let history: HistoryRowData[] = [];
+  try {
+    const HISTORY_SHEET_NAME = 'Lịch sử giao hàng';
+    history = await fetchHistorySheetFromGviz(sheetId, HISTORY_SHEET_NAME);
+  } catch {
+    // History sheet not available or not found — ignore
+  }
+
+  return { trucks, priorityTrucks, history, hasPrioritySupport: true };
+}
+
+/**
+ * Parse gviz table rows into HistoryRowData[]
+ */
+async function fetchHistorySheetFromGviz(sheetId: string, histSheetName: string): Promise<HistoryRowData[]> {
+  let histTable: any = null;
+
+  // Try local proxy first
+  try {
+    const proxyParams = new URLSearchParams({
+      url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
+      sheetName: histSheetName,
+    });
+    const res = await fetch(`/api/gas-proxy?${proxyParams.toString()}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.table && Array.isArray(data.table.rows)) {
+        histTable = data.table;
+      }
+    }
+  } catch {
+    // proxy not available
+  }
+
+  // Fallback: direct gviz fetch
+  if (!histTable) {
+    const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(histSheetName)}`;
+    try {
+      const res = await fetch(gvizUrl, { mode: 'cors' });
+      const text = await res.text();
+      const start = text.indexOf('{');
+      const end = text.lastIndexOf('}');
+      if (start !== -1 && end !== -1) {
+        const json = JSON.parse(text.slice(start, end + 1));
+        if (json.status === 'ok' && json.table) histTable = json.table;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!histTable || !Array.isArray(histTable.rows)) return [];
+
+  const hCols = (histTable.cols || []).map((c: any) => String(c?.label || '').trim().toLowerCase());
+
+  const findH = (pattern: RegExp, def: number) => {
+    const found = hCols.findIndex((n: string) => pattern.test(n));
+    return found !== -1 ? found : def;
+  };
+
+  const hIdxTs      = findH(/thời gian|time|timestamp|ngày/, 0);
+  const hIdxPlate   = findH(/biển|bien|plate|số xe/, 1);
+  const hIdxType    = findH(/loại xe|loai xe|type/, 2);
+  const hIdxCall    = findH(/số lần|so lan|gọi|call/, 3);
+  const hIdxDock    = findH(/cửa|cua|dock|gate/, 4);
+  const hIdxNotes   = findH(/ghi chú|ghi chu|note/, 5);
+  const hIdxPrio    = findH(/ưu tiên|uu tien|priority/, 6);
+  const hIdxInTime  = findH(/vào lúc|vao luc|in.?time|giờ vào|gio vao/, 7);
+  const hIdxCar     = findH(/sl|số lượng|so luong|pallet/, 8);
+  const hIdxPos     = findH(/vị trí|vi tri|position/, 9);
+
+  const hRows = histTable.rows as any[];
+  // Skip header row if first row contains label keywords
+  let startIdx = 0;
+  if (hRows.length > 0) {
+    const first = (hRows[0].c || []).map((cell: any) => String(cell?.v || '').toLowerCase());
+    if (first.some((v: string) => v.includes('biển') || v.includes('xe') || v.includes('cửa') || v.includes('dock'))) {
+      startIdx = 1;
+    }
+  }
+
+  const getHVal = (row: any, idx: number): string => {
+    const c = row.c || [];
+    if (!c[idx] || c[idx].v === null || c[idx].v === undefined) return '';
+    if (c[idx].f) return String(c[idx].f).trim();
+    const val = String(c[idx].v).trim();
+    const dateMatch = val.match(/Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)/);
+    if (dateMatch) {
+      const [, y, m, d, hh = '0', mm = '0', ss = '0'] = dateMatch;
+      return `${String(d).padStart(2, '0')}/${String(Number(m) + 1).padStart(2, '0')}/${y} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+    }
+    return val;
+  };
+
+  return hRows.slice(startIdx)
+    .map((row: any) => ({
+      timestamp: getHVal(row, hIdxTs),
+      plate: getHVal(row, hIdxPlate).toUpperCase(),
+      vehicleType: getHVal(row, hIdxType),
+      callCount: Number(getHVal(row, hIdxCall)) || 1,
+      dock: getHVal(row, hIdxDock),
+      notes: getHVal(row, hIdxNotes),
+      priority: getHVal(row, hIdxPrio),
+      inTime: getHVal(row, hIdxInTime),
+      carCount: Number(getHVal(row, hIdxCar)) || 1,
+      waitingPosition: getHVal(row, hIdxPos) || '15m',
+    }))
+    .filter((h: HistoryRowData) => Boolean(h.plate));
 }
 
 /**
