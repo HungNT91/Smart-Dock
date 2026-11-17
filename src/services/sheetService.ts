@@ -913,32 +913,47 @@ export function extractSheetId(urlOrId: string): string {
 }
 
 /**
- * Helper: fetch a single gviz sheet table by sheet name, trying proxy then direct.
+ * Returns true when running on a backend-capable dev/prod server (localhost or same-origin Express).
+ * Returns false on static hosting like GitHub Pages where /api/* routes don't exist.
+ */
+function hasBackendProxy(): boolean {
+  if (typeof window === 'undefined') return true; // SSR / Node — assume proxy available
+  const host = window.location.hostname;
+  return host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.');
+}
+
+/**
+ * Helper: fetch a single gviz sheet table by sheet name.
+ * - On localhost: tries /api/gas-proxy first (server-side, no CORS), falls back to direct.
+ * - On GitHub Pages / static hosting: goes straight to direct gviz fetch (no proxy available).
  * Returns null if not available. Never throws.
  */
 async function fetchGvizTable(sheetId: string, sheetName?: string): Promise<any | null> {
-  // 1. Try local server proxy first
-  try {
-    const proxyParams = new URLSearchParams({
-      url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
-    });
-    if (sheetName) proxyParams.set('sheetName', sheetName);
-    const res = await fetch(`/api/gas-proxy?${proxyParams.toString()}`);
-    if (res.ok) {
-      const data = await res.json();
-      if (data.status === 'error' && data.errors && data.errors.length > 0) {
-        // A real gviz error (e.g. sheet permissions) — propagate it
-        throw new Error(`Google Sheet báo lỗi: ${data.errors[0].message || data.errors[0].detailed_message}`);
+  const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : ''}`;
+
+  // 1. Try local server proxy first — ONLY on backend-capable hosts (localhost etc.)
+  if (hasBackendProxy()) {
+    try {
+      const proxyParams = new URLSearchParams({
+        url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
+      });
+      if (sheetName) proxyParams.set('sheetName', sheetName);
+      const res = await fetch(`/api/gas-proxy?${proxyParams.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === 'error' && data.errors && data.errors.length > 0) {
+          // A real gviz error (sheet permissions etc.) — propagate it
+          throw new Error(`Google Sheet báo lỗi: ${data.errors[0].message || data.errors[0].detailed_message}`);
+        }
+        if (data.table && Array.isArray(data.table.rows)) return data.table;
       }
-      if (data.table && Array.isArray(data.table.rows)) return data.table;
+    } catch (err: any) {
+      if (err.message && err.message.includes('Google Sheet báo lỗi')) throw err;
+      // Proxy request failed — fall through to direct fetch below
     }
-  } catch (err: any) {
-    if (err.message && err.message.includes('Google Sheet báo lỗi')) throw err;
-    // Proxy not reachable (e.g. GitHub Pages) — fall through to direct fetch
   }
 
-  // 2. Direct gviz fetch (GitHub Pages / static hosting)
-  const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : ''}`;
+  // 2. Direct gviz fetch — always used on GitHub Pages; fallback on localhost
   try {
     const res = await fetch(gvizUrl, { mode: 'cors' });
     const text = await res.text();
@@ -946,11 +961,11 @@ async function fetchGvizTable(sheetId: string, sheetName?: string): Promise<any 
     const end = text.lastIndexOf('}');
     if (start !== -1 && end !== -1) {
       const json = JSON.parse(text.slice(start, end + 1));
-      if (json.status === 'error') return null;      // sheet not found — caller decides
+      if (json.status === 'error') return null; // sheet not found — caller decides
       if (json.table && Array.isArray(json.table.rows)) return json.table;
     }
   } catch {
-    // ignore
+    // ignore network or parse errors
   }
   return null;
 }
