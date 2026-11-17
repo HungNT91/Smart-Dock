@@ -124,7 +124,18 @@ async function startServer() {
     }
   });
 
+  // Favicon handler
+  app.get('/favicon.ico', (_req, res) => {
+    res.status(204).end();
+  });
+
   // Stale PWA handlers: Cleanly handle requests from previous localhost:3000 projects
+  app.get(['/sw.js', '/service-worker.js', '/registerSW.js', '/workbox-*.js'], (_req, res) => {
+    res
+      .status(200)
+      .type('application/javascript')
+      .send('self.addEventListener("install", () => self.skipWaiting()); self.addEventListener("activate", () => self.registration.unregister());');
+  });
   app.get('/@vite-plugin-pwa/*', (_req, res) => {
     res.status(200).type('application/javascript').send('export default {};');
   });
