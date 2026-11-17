@@ -913,7 +913,162 @@ export function extractSheetId(urlOrId: string): string {
 }
 
 /**
- * Fetch data directly from a public Google Sheet URL using gviz
+ * Helper: fetch a single gviz sheet table by sheet name, trying proxy then direct.
+ * Returns null if not available. Never throws.
+ */
+async function fetchGvizTable(sheetId: string, sheetName?: string): Promise<any | null> {
+  // 1. Try local server proxy first
+  try {
+    const proxyParams = new URLSearchParams({
+      url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
+    });
+    if (sheetName) proxyParams.set('sheetName', sheetName);
+    const res = await fetch(`/api/gas-proxy?${proxyParams.toString()}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.status === 'error' && data.errors && data.errors.length > 0) {
+        // A real gviz error (e.g. sheet permissions) — propagate it
+        throw new Error(`Google Sheet báo lỗi: ${data.errors[0].message || data.errors[0].detailed_message}`);
+      }
+      if (data.table && Array.isArray(data.table.rows)) return data.table;
+    }
+  } catch (err: any) {
+    if (err.message && err.message.includes('Google Sheet báo lỗi')) throw err;
+    // Proxy not reachable (e.g. GitHub Pages) — fall through to direct fetch
+  }
+
+  // 2. Direct gviz fetch (GitHub Pages / static hosting)
+  const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : ''}`;
+  try {
+    const res = await fetch(gvizUrl, { mode: 'cors' });
+    const text = await res.text();
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end !== -1) {
+      const json = JSON.parse(text.slice(start, end + 1));
+      if (json.status === 'error') return null;      // sheet not found — caller decides
+      if (json.table && Array.isArray(json.table.rows)) return json.table;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Parse a raw gviz table into Truck[] using keyword-based column detection.
+ * isPrioritySheet = true forces sourceSheet = 'priority' on every row.
+ */
+function parseGvizTableToTrucks(table: any, isPrioritySheet: boolean): Truck[] {
+  const cols = table.cols || [];
+  const rows = table.rows || [];
+
+  // Build column names from table.cols labels; supplement with row-0 header if cols labels are empty
+  let headerRowIndex = -1;
+  const colNames: string[] = cols.map((c: any) => String(c?.label || '').trim());
+
+  if (rows.length > 0) {
+    const firstRowValues = (rows[0].c || []).map((cell: any) =>
+      String(cell?.v || '').trim().toLowerCase()
+    );
+    const hasHeaderKeywords = firstRowValues.some((v: string) =>
+      v.includes('biển') || v.includes('xe') || v.includes('cửa') ||
+      v.includes('dock') || v.includes('thời gian') || v.includes('time')
+    );
+    if (hasHeaderKeywords) {
+      headerRowIndex = 0;
+      for (let i = 0; i < firstRowValues.length; i++) {
+        if (!colNames[i]) colNames[i] = firstRowValues[i];
+      }
+    }
+  }
+
+  const findCol = (pattern: RegExp, defaultIdx: number): number => {
+    const found = colNames.findIndex((name) => pattern.test(name.toLowerCase()));
+    return found !== -1 ? found : defaultIdx;
+  };
+
+  const idxTimestamp = findCol(/thời gian|time|timestamp|ngày|ngay|giờ|gio/, 0);
+  const idxPlate     = findCol(/biển|bien|plate|số xe|so xe/, 1);
+  const idxType      = findCol(/loại xe|loai xe|type/, 2);
+  const idxCallCount = findCol(/số lần gọi|so lan goi|gọi|call/, 3);
+  const idxDock      = findCol(/cửa|cua|dock|gate/, 4);
+  const idxNotes     = findCol(/ghi chú|ghi chu|note/, 5);
+  const idxPriority  = findCol(/ưu tiên|uu tien|priority/, 6);
+  const idxCarCount  = findCol(/sl|số lượng|so luong|pallet/, 7);
+  const idxPosition  = findCol(/vị trí|vi tri|position/, 8);
+
+  const dataRows = headerRowIndex === 0 ? rows.slice(1) : rows;
+
+  const getVal = (c: any[], idx: number): string => {
+    if (!c[idx] || c[idx].v === null || c[idx].v === undefined) return '';
+    if (c[idx].f) return String(c[idx].f).trim();
+    const val = String(c[idx].v).trim();
+    const dateMatch = val.match(/Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)/);
+    if (dateMatch) {
+      const [, y, m, d, hh = '0', mm = '0', ss = '0'] = dateMatch;
+      return `${String(d).padStart(2, '0')}/${String(Number(m) + 1).padStart(2, '0')}/${y} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+    }
+    return val;
+  };
+
+  const result: Truck[] = [];
+  dataRows.forEach((r: any, rowIdx: number) => {
+    const c = r.c || [];
+    const plate = getVal(c, idxPlate).toUpperCase();
+    if (!plate) return;
+
+    const timestamp    = getVal(c, idxTimestamp);
+    const vehicleTypeStr = getVal(c, idxType);
+    const callCountVal = Number(getVal(c, idxCallCount)) || 0;
+    const dockStr      = getVal(c, idxDock);
+    const notes        = getVal(c, idxNotes);
+    const priority     = getVal(c, idxPriority);
+    const carCount     = Number(getVal(c, idxCarCount)) || 1;
+    const waitingPosition = getVal(c, idxPosition) || '15m';
+
+    const dockId = findDockIndexById(dockStr);
+    const status: 'waiting' | 'moving' | 'busy' | 'completed' = dockId !== null ? 'busy' : 'waiting';
+
+    // A row counts as "priority" if it comes from the priority sheet, OR the priority column says so
+    const isMArkedPriority =
+      priority.toLowerCase().includes('ưu tiên') ||
+      priority.toLowerCase().includes('priority') ||
+      notes.toLowerCase().includes('ưu tiên');
+    const isPrio = isPrioritySheet || isMArkedPriority;
+
+    result.push({
+      id: `${isPrio ? 'GSH-PRIO' : 'GSH'}-${plate}`,
+      plate,
+      type: mapTypeNameToKey(vehicleTypeStr),
+      supplier: 'NCC',
+      pallets: carCount * 5 || 5,
+      assignedDock: dockId !== null ? DOCK_DEFINITIONS[dockId].id : null,
+      dockId,
+      checkInTime: timestamp ? timestamp.slice(-8, -3) : '09:00',
+      arrivalTimeMs: Date.now() - (rowIdx * 5 + 5) * 60 * 1000,
+      status,
+      spot: status === 'waiting' ? result.filter(t => t.status === 'waiting').length : null,
+      notes,
+      timestamp,
+      callCount: callCountVal || undefined,
+      priority: priority || (isPrio ? 'Ưu tiên' : ''),
+      carCount,
+      waitingPosition,
+      sheetRowIndex: headerRowIndex === 0 ? rowIdx + 2 : rowIdx + 1,
+      sourceSheet: isPrio ? 'priority' : 'active',
+    });
+  });
+
+  return result;
+}
+
+/**
+ * Fetch data directly from a public Google Sheet URL using gviz.
+ * Reads 3 sheets in parallel:
+ *   1. "Thông Tin Giao Hàng" (or the name passed in) → trucks (waiting queue)
+ *   2. "Ưu Tiên"                                     → priorityTrucks
+ *   3. "Lịch sử giao hàng"                           → history
  */
 export async function fetchFromGoogleSheetUrl(
   urlOrId: string,
@@ -925,258 +1080,90 @@ export async function fetchFromGoogleSheetUrl(
   hasPrioritySupport: boolean;
 }> {
   const cleanUrl = urlOrId.trim();
-  if (!cleanUrl) {
-    throw new Error('Vui lòng nhập đường link Google Sheet');
-  }
+  if (!cleanUrl) throw new Error('Vui lòng nhập đường link Google Sheet');
 
   const sheetId = extractSheetId(cleanUrl);
-  if (!sheetId) {
-    throw new Error('Không thể xác định Sheet ID từ đường dẫn Google Sheet');
-  }
+  if (!sheetId) throw new Error('Không thể xác định Sheet ID từ đường dẫn Google Sheet');
 
-  let table: any = null;
+  const ACTIVE_SHEET   = sheetName || 'Thông Tin Giao Hàng';
+  const PRIORITY_SHEET = 'Ưu Tiên';
+  const HISTORY_SHEET  = 'Lịch sử giao hàng';
 
-  // 1. Try local server proxy first (used in local development)
-  try {
-    const proxyParams = new URLSearchParams({
-      url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
-    });
-    if (sheetName) {
-      proxyParams.set('sheetName', sheetName);
-    }
-    const proxyUrl = `/api/gas-proxy?${proxyParams.toString()}`;
-    const res = await fetch(proxyUrl);
-    if (res.ok) {
-      const data = await res.json();
-      if (data.status === 'error' && data.errors && data.errors.length > 0) {
-        throw new Error(`Google Sheet báo lỗi: ${data.errors[0].message || data.errors[0].detailed_message}`);
-      }
-      if (data.table && Array.isArray(data.table.rows)) {
-        table = data.table;
-      }
-    }
-  } catch (err: any) {
-    if (err.message && err.message.includes('Google Sheet báo lỗi')) throw err;
-    // Local proxy not available (e.g. static hosting on GitHub Pages), fallback to direct fetch below
-  }
+  // Fetch all 3 sheets in parallel; individual failures are tolerated
+  const [activeTable, priorityTable, histTable] = await Promise.all([
+    fetchGvizTable(sheetId, ACTIVE_SHEET).catch(() => null),
+    fetchGvizTable(sheetId, PRIORITY_SHEET).catch(() => null),
+    fetchGvizTable(sheetId, HISTORY_SHEET).catch(() => null),
+  ]);
 
-  // 2. Direct fetch from Google gviz (works on GitHub Pages / static hosting without server backend)
-  if (!table) {
-    const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : ''}`;
-    try {
-      const directRes = await fetch(gvizUrl, { mode: 'cors' });
-      const text = await directRes.text();
-      const start = text.indexOf('{');
-      const end = text.lastIndexOf('}');
-      if (start !== -1 && end !== -1) {
-        const json = JSON.parse(text.slice(start, end + 1));
-        if (json.status === 'error' && sheetName) {
-          // Fallback to first sheet
-          const fbUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json`;
-          const fbRes = await fetch(fbUrl, { mode: 'cors' });
-          const fbText = await fbRes.text();
-          const fStart = fbText.indexOf('{');
-          const fEnd = fbText.lastIndexOf('}');
-          if (fStart !== -1 && fEnd !== -1) {
-            const fbJson = JSON.parse(fbText.slice(fStart, fEnd + 1));
-            table = fbJson.table;
-          }
-        } else {
-          table = json.table;
-        }
-      }
-    } catch {
-      // Failed direct fetch
-    }
-  }
-
-  if (!table || !Array.isArray(table.rows)) {
-    throw new Error('Không đọc được bảng dữ liệu từ Google Sheet. Hãy kiểm tra quyền chia sẻ công khai: "Bất kỳ ai có đường liên kết đều có thể xem".');
-  }
-
-  const cols = table.cols || [];
-  const rows = table.rows || [];
-
-  // Determine headers: check table.cols or row 0
-  let headerRowIndex = -1;
-  const colNames: string[] = cols.map((c: any) => String(c?.label || '').trim());
-
-  if (rows.length > 0) {
-    const firstRowValues = (rows[0].c || []).map((cell: any) => String(cell?.v || '').trim().toLowerCase());
-    const hasHeaderKeywords = firstRowValues.some((v: string) =>
-      v.includes('biển') || v.includes('xe') || v.includes('cửa') || v.includes('dock') || v.includes('thời gian') || v.includes('time')
+  // Active sheet is mandatory — throw if it could not be fetched
+  if (!activeTable || !Array.isArray(activeTable.rows)) {
+    throw new Error(
+      'Không đọc được bảng dữ liệu từ Google Sheet. ' +
+      'Hãy kiểm tra quyền chia sẻ công khai: "Bất kỳ ai có đường liên kết đều có thể xem".'
     );
-    if (hasHeaderKeywords) {
-      headerRowIndex = 0;
-      for (let i = 0; i < firstRowValues.length; i++) {
-        if (!colNames[i]) colNames[i] = firstRowValues[i];
-      }
-    }
   }
 
-  const findColIndex = (pattern: RegExp, defaultIdx: number): number => {
-    const found = colNames.findIndex((name) => pattern.test(name.toLowerCase()));
-    return found !== -1 ? found : defaultIdx;
-  };
+  // Parse "Thông Tin Giao Hàng" → trucks  (some rows may be tagged priority via column)
+  const allActiveTrucks = parseGvizTableToTrucks(activeTable, false);
+  const trucks         = allActiveTrucks.filter(t => t.sourceSheet !== 'priority');
+  const inlineProirity = allActiveTrucks.filter(t => t.sourceSheet === 'priority');
 
-  const idxTimestamp = findColIndex(/thời gian|time|timestamp|ngày|ngay|giờ|gio/, 0);
-  const idxPlate = findColIndex(/biển|bien|plate|số xe|so xe/, 1);
-  const idxType = findColIndex(/loại xe|loai xe|type/, 2);
-  const idxCallCount = findColIndex(/số lần gọi|so lan goi|gọi|call/, 3);
-  const idxDock = findColIndex(/cửa|cua|dock|gate/, 4);
-  const idxNotes = findColIndex(/ghi chú|ghi chu|note/, 5);
-  const idxPriority = findColIndex(/ưu tiên|uu tien|priority/, 6);
-  const idxCarCount = findColIndex(/sl|số lượng|so luong|pallet/, 7);
-  const idxPosition = findColIndex(/vị trí|vi tri|position/, 8);
+  // Parse "Ưu Tiên" sheet → priorityTrucks
+  const sheetPriorityTrucks = priorityTable
+    ? parseGvizTableToTrucks(priorityTable, true)
+    : [];
 
-  const dataRows = headerRowIndex === 0 ? rows.slice(1) : rows;
+  // Merge: deduplicate by plate (priority sheet wins over inline-priority flag)
+  const seenPrioPlates = new Set(sheetPriorityTrucks.map(t => t.plate));
+  const mergedPriority = [
+    ...sheetPriorityTrucks,
+    ...inlineProirity.filter(t => !seenPrioPlates.has(t.plate)),
+  ];
 
-  const trucks: Truck[] = [];
-  const priorityTrucks: Truck[] = [];
+  const hasPrioritySupport = sheetPriorityTrucks.length > 0 || inlineProirity.length > 0;
 
-  dataRows.forEach((r: any, rowIdx: number) => {
-    const c = r.c || [];
-    const getVal = (idx: number) => {
-      if (!c[idx] || c[idx].v === null || c[idx].v === undefined) return '';
-      if (c[idx].f) return String(c[idx].f).trim();
-      const val = String(c[idx].v).trim();
-      const dateMatch = val.match(/Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)/);
-      if (dateMatch) {
-        const [, y, m, d, hh = '0', mm = '0', ss = '0'] = dateMatch;
-        return `${String(d).padStart(2, '0')}/${String(Number(m) + 1).padStart(2, '0')}/${y} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
-      }
-      return val;
-    };
+  // Parse "Lịch sử giao hàng" → history
+  const history = histTable ? parseGvizTableToHistory(histTable) : [];
 
-    const plate = getVal(idxPlate).toUpperCase();
-    if (!plate) return;
-
-    const timestamp = getVal(idxTimestamp);
-    const vehicleTypeStr = getVal(idxType);
-    const callCountVal = Number(getVal(idxCallCount)) || 0;
-    const dockStr = getVal(idxDock);
-    const notes = getVal(idxNotes);
-    const priority = getVal(idxPriority);
-    const carCount = Number(getVal(idxCarCount)) || 1;
-    const waitingPosition = getVal(idxPosition) || '15m';
-
-    const dockId = findDockIndexById(dockStr);
-    const status: 'waiting' | 'moving' | 'busy' | 'completed' = dockId !== null ? 'busy' : 'waiting';
-
-    const isPriority = priority.toLowerCase().includes('ưu tiên') || priority.toLowerCase().includes('priority') || notes.toLowerCase().includes('ưu tiên');
-
-    const truckItem: Truck = {
-      id: `${isPriority ? 'GSH-PRIO' : 'GSH'}-${plate || rowIdx + 1}`,
-      plate,
-      type: mapTypeNameToKey(vehicleTypeStr),
-      supplier: 'NCC',
-      pallets: carCount * 5 || 5,
-      assignedDock: dockId !== null ? DOCK_DEFINITIONS[dockId].id : null,
-      dockId,
-      checkInTime: timestamp ? timestamp.slice(-8, -3) : '09:00',
-      arrivalTimeMs: Date.now() - (rowIdx * 5 + 5) * 60 * 1000,
-      status,
-      spot: status === 'waiting' ? (isPriority ? priorityTrucks.filter(t => t.status === 'waiting').length : trucks.filter(t => t.status === 'waiting').length) : null,
-      notes,
-      timestamp,
-      callCount: callCountVal || undefined,
-      priority: priority || (isPriority ? 'Ưu tiên' : ''),
-      carCount,
-      waitingPosition,
-      sheetRowIndex: headerRowIndex === 0 ? rowIdx + 2 : rowIdx + 1,
-      sourceSheet: isPriority ? 'priority' : 'active',
-    };
-
-    if (isPriority) {
-      priorityTrucks.push(truckItem);
-    } else {
-      trucks.push(truckItem);
-    }
-  });
-
-  // Fetch history sheet in parallel (best-effort, never throws)
-  let history: HistoryRowData[] = [];
-  try {
-    const HISTORY_SHEET_NAME = 'Lịch sử giao hàng';
-    history = await fetchHistorySheetFromGviz(sheetId, HISTORY_SHEET_NAME);
-  } catch {
-    // History sheet not available or not found — ignore
-  }
-
-  return { trucks, priorityTrucks, history, hasPrioritySupport: true };
+  return { trucks, priorityTrucks: mergedPriority, history, hasPrioritySupport };
 }
 
 /**
- * Parse gviz table rows into HistoryRowData[]
+ * Parse a raw gviz table into HistoryRowData[].
  */
-async function fetchHistorySheetFromGviz(sheetId: string, histSheetName: string): Promise<HistoryRowData[]> {
-  let histTable: any = null;
+function parseGvizTableToHistory(table: any): HistoryRowData[] {
+  const hCols = (table.cols || []).map((c: any) => String(c?.label || '').trim().toLowerCase());
+  const hRows = (table.rows || []) as any[];
 
-  // Try local proxy first
-  try {
-    const proxyParams = new URLSearchParams({
-      url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
-      sheetName: histSheetName,
-    });
-    const res = await fetch(`/api/gas-proxy?${proxyParams.toString()}`);
-    if (res.ok) {
-      const data = await res.json();
-      if (data.table && Array.isArray(data.table.rows)) {
-        histTable = data.table;
-      }
-    }
-  } catch {
-    // proxy not available
-  }
-
-  // Fallback: direct gviz fetch
-  if (!histTable) {
-    const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(histSheetName)}`;
-    try {
-      const res = await fetch(gvizUrl, { mode: 'cors' });
-      const text = await res.text();
-      const start = text.indexOf('{');
-      const end = text.lastIndexOf('}');
-      if (start !== -1 && end !== -1) {
-        const json = JSON.parse(text.slice(start, end + 1));
-        if (json.status === 'ok' && json.table) histTable = json.table;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  if (!histTable || !Array.isArray(histTable.rows)) return [];
-
-  const hCols = (histTable.cols || []).map((c: any) => String(c?.label || '').trim().toLowerCase());
-
-  const findH = (pattern: RegExp, def: number) => {
+  const findH = (pattern: RegExp, def: number): number => {
     const found = hCols.findIndex((n: string) => pattern.test(n));
     return found !== -1 ? found : def;
   };
 
-  const hIdxTs      = findH(/thời gian|time|timestamp|ngày/, 0);
-  const hIdxPlate   = findH(/biển|bien|plate|số xe/, 1);
-  const hIdxType    = findH(/loại xe|loai xe|type/, 2);
-  const hIdxCall    = findH(/số lần|so lan|gọi|call/, 3);
-  const hIdxDock    = findH(/cửa|cua|dock|gate/, 4);
-  const hIdxNotes   = findH(/ghi chú|ghi chu|note/, 5);
-  const hIdxPrio    = findH(/ưu tiên|uu tien|priority/, 6);
-  const hIdxInTime  = findH(/vào lúc|vao luc|in.?time|giờ vào|gio vao/, 7);
-  const hIdxCar     = findH(/sl|số lượng|so luong|pallet/, 8);
-  const hIdxPos     = findH(/vị trí|vi tri|position/, 9);
+  const hIdxTs     = findH(/thời gian|time|timestamp|ngày/, 0);
+  const hIdxPlate  = findH(/biển|bien|plate|số xe/, 1);
+  const hIdxType   = findH(/loại xe|loai xe|type/, 2);
+  const hIdxCall   = findH(/số lần|so lan|gọi|call/, 3);
+  const hIdxDock   = findH(/cửa|cua|dock|gate/, 4);
+  const hIdxNotes  = findH(/ghi chú|ghi chu|note/, 5);
+  const hIdxPrio   = findH(/ưu tiên|uu tien|priority/, 6);
+  const hIdxInTime = findH(/vào lúc|vao luc|in.?time|giờ vào|gio vao/, 7);
+  const hIdxCar    = findH(/sl|số lượng|so luong|pallet/, 8);
+  const hIdxPos    = findH(/vị trí|vi tri|position/, 9);
 
-  const hRows = histTable.rows as any[];
-  // Skip header row if first row contains label keywords
+  // Skip header row if the first data row contains label keywords
   let startIdx = 0;
   if (hRows.length > 0) {
     const first = (hRows[0].c || []).map((cell: any) => String(cell?.v || '').toLowerCase());
-    if (first.some((v: string) => v.includes('biển') || v.includes('xe') || v.includes('cửa') || v.includes('dock'))) {
+    if (first.some((v: string) =>
+      v.includes('biển') || v.includes('xe') || v.includes('cửa') || v.includes('dock')
+    )) {
       startIdx = 1;
     }
   }
 
-  const getHVal = (row: any, idx: number): string => {
+  const getCellVal = (row: any, idx: number): string => {
     const c = row.c || [];
     if (!c[idx] || c[idx].v === null || c[idx].v === undefined) return '';
     if (c[idx].f) return String(c[idx].f).trim();
@@ -1189,18 +1176,19 @@ async function fetchHistorySheetFromGviz(sheetId: string, histSheetName: string)
     return val;
   };
 
-  return hRows.slice(startIdx)
+  return hRows
+    .slice(startIdx)
     .map((row: any) => ({
-      timestamp: getHVal(row, hIdxTs),
-      plate: getHVal(row, hIdxPlate).toUpperCase(),
-      vehicleType: getHVal(row, hIdxType),
-      callCount: Number(getHVal(row, hIdxCall)) || 1,
-      dock: getHVal(row, hIdxDock),
-      notes: getHVal(row, hIdxNotes),
-      priority: getHVal(row, hIdxPrio),
-      inTime: getHVal(row, hIdxInTime),
-      carCount: Number(getHVal(row, hIdxCar)) || 1,
-      waitingPosition: getHVal(row, hIdxPos) || '15m',
+      timestamp:       getCellVal(row, hIdxTs),
+      plate:           getCellVal(row, hIdxPlate).toUpperCase(),
+      vehicleType:     getCellVal(row, hIdxType),
+      callCount:       Number(getCellVal(row, hIdxCall)) || 1,
+      dock:            getCellVal(row, hIdxDock),
+      notes:           getCellVal(row, hIdxNotes),
+      priority:        getCellVal(row, hIdxPrio),
+      inTime:          getCellVal(row, hIdxInTime),
+      carCount:        Number(getCellVal(row, hIdxCar)) || 1,
+      waitingPosition: getCellVal(row, hIdxPos) || '15m',
     }))
     .filter((h: HistoryRowData) => Boolean(h.plate));
 }
