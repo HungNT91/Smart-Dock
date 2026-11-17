@@ -927,27 +927,64 @@ export async function fetchFromGoogleSheetUrl(
     throw new Error('Không thể xác định Sheet ID từ đường dẫn Google Sheet');
   }
 
-  const proxyParams = new URLSearchParams({
-    url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
-  });
-  if (sheetName) {
-    proxyParams.set('sheetName', sheetName);
+  let table: any = null;
+
+  // 1. Try local server proxy first (used in local development)
+  try {
+    const proxyParams = new URLSearchParams({
+      url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
+    });
+    if (sheetName) {
+      proxyParams.set('sheetName', sheetName);
+    }
+    const proxyUrl = `/api/gas-proxy?${proxyParams.toString()}`;
+    const res = await fetch(proxyUrl);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.status === 'error' && data.errors && data.errors.length > 0) {
+        throw new Error(`Google Sheet báo lỗi: ${data.errors[0].message || data.errors[0].detailed_message}`);
+      }
+      if (data.table && Array.isArray(data.table.rows)) {
+        table = data.table;
+      }
+    }
+  } catch (err: any) {
+    if (err.message && err.message.includes('Google Sheet báo lỗi')) throw err;
+    // Local proxy not available (e.g. static hosting on GitHub Pages), fallback to direct fetch below
   }
 
-  const proxyUrl = `/api/gas-proxy?${proxyParams.toString()}`;
-  const res = await fetch(proxyUrl);
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+  // 2. Direct fetch from Google gviz (works on GitHub Pages / static hosting without server backend)
+  if (!table) {
+    const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : ''}`;
+    try {
+      const directRes = await fetch(gvizUrl, { mode: 'cors' });
+      const text = await directRes.text();
+      const start = text.indexOf('{');
+      const end = text.lastIndexOf('}');
+      if (start !== -1 && end !== -1) {
+        const json = JSON.parse(text.slice(start, end + 1));
+        if (json.status === 'error' && sheetName) {
+          // Fallback to first sheet
+          const fbUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json`;
+          const fbRes = await fetch(fbUrl, { mode: 'cors' });
+          const fbText = await fbRes.text();
+          const fStart = fbText.indexOf('{');
+          const fEnd = fbText.lastIndexOf('}');
+          if (fStart !== -1 && fEnd !== -1) {
+            const fbJson = JSON.parse(fbText.slice(fStart, fEnd + 1));
+            table = fbJson.table;
+          }
+        } else {
+          table = json.table;
+        }
+      }
+    } catch {
+      // Failed direct fetch
+    }
   }
 
-  if (data.status === 'error' && data.errors && data.errors.length > 0) {
-    throw new Error(`Google Sheet báo lỗi: ${data.errors[0].message || data.errors[0].detailed_message}`);
-  }
-
-  const table = data.table;
   if (!table || !Array.isArray(table.rows)) {
-    throw new Error('Không đọc được bảng dữ liệu từ Google Sheet. Hãy kiểm tra quyền chia sẻ công khai.');
+    throw new Error('Không đọc được bảng dữ liệu từ Google Sheet. Hãy kiểm tra quyền chia sẻ công khai: "Bất kỳ ai có đường liên kết đều có thể xem".');
   }
 
   const cols = table.cols || [];
