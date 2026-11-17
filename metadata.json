@@ -1,0 +1,6 @@
+{
+  "name": "Smart Dock & Delivery Queue - Google Apps Script",
+  "description": "Hệ thống quản lý hàng đợi xe giao hàng và điều phối cửa dock kho vận thời gian thực, tích hợp Google Sheets và Google Apps Script HTMLService.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
