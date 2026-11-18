@@ -721,24 +721,15 @@ export default function App() {
   }, [dataLoaded, syncConfig.mode, syncConfig.autoSync, syncConfig.gasWebAppUrl, syncConfig.sheetUrl, syncConfig.pollIntervalSec, syncWithGasLive]);
 
   // Derived state: Queue trucks
-  // Thuật toán "Thời điểm hàng chờ hiệu dụng (Effective Queue Time)":
-  //
-  // Xe thường (chưa bị bỏ qua):
-  //   effectiveTime = timestamp đăng ký → xe đến trước xếp trước
-  //
-  // Xe bị Bỏ Qua và ĐÃ có skip time trong localStorage (ghi lại lúc bỏ qua):
-  //   effectiveTime = thời điểm bỏ qua → xe đứng đúng vị trí đã tịnh tiến
-  //   VD: 41D76896 bỏ qua lúc 10:09 → xếp sau 51D89458 (10:08) và trước 50H41678 (10:09:55)
-  //       Xe mới đăng ký lúc 12:26, 12:47 > 10:09 → tự động xếp SAU 41D76896 ✓
-  //
-  // Xe có note "Bỏ Qua" nhưng CHƯA có localStorage (lần đầu mở app):
-  //   effectiveTime = max(timestamps xe thường) + offset nhỏ
-  //   → Xe được đặt cuối hàng chờ, tịnh tiến lên khi xe phía trước được gọi đi ✓
+  // Nguồn sự thật: thứ tự dòng trong Google Sheet (do GAS quản lý).
+  // - GAS tự động append xe Bỏ Qua xuống cuối sheet.
+  // - Khi xe phía trên được gọi, GAS xóa dòng đó → xe Bỏ Qua tự tịnh tiến lên mà không cần logic thêm.
+  // - Xe mới đăng ký được GAS append dưới cùng → luôn xếp sau xe Bỏ Qua.
+  // App chỉ cần đọc thứ tự dòng từ gviz và hiển thị đúng như vậy.
   const queueTrucks = useMemo(() => {
-    const skippedMap = skippedOrderRef.current;
     const seenPlates = new Set<string>();
 
-    // Loại bỏ xe đang được giao tại cửa dock khỏi hàng chờ
+    // Loại bỏ xe đang được giao tại cửa dock
     docks.forEach((d) => {
       if (d.currentTruck?.plate) {
         seenPlates.add(d.currentTruck.plate.trim().toUpperCase());
@@ -747,7 +738,7 @@ export default function App() {
 
     const allWaiting: Truck[] = [];
 
-    // Duyệt theo thứ tự dòng sheet — sẽ dùng làm tiebreaker cho xe Bỏ Qua cùng estimatedTime
+    // Duyệt theo thứ tự dòng gviz = thứ tự vật lý trong Google Sheet
     trucks.forEach((t) => {
       if (t.status !== 'waiting') return;
       const key = t.plate.trim().toUpperCase();
@@ -756,6 +747,7 @@ export default function App() {
       allWaiting.push(t);
     });
 
+    // Xe từ sheet "Ưu Tiên" xếp tiếp theo nếu chưa hiện
     priorityTrucks.forEach((t) => {
       if (t.status !== 'waiting') return;
       const key = t.plate.trim().toUpperCase();
@@ -764,52 +756,7 @@ export default function App() {
       allWaiting.push(t);
     });
 
-    // Helper: kiểm tra xe có note "Bỏ Qua" không
-    const isMarkedBoQua = (t: Truck): boolean => {
-      const notes = (t.notes || '').toUpperCase();
-      const pos = (t.waitingPosition || '').toUpperCase();
-      return /BỎ\s*QUA|BO\s*QUA/.test(notes) || /BỎ\s*QUA|BO\s*QUA/.test(pos);
-    };
-
-    // Tìm max timestamp của tất cả xe KHÔNG bị bỏ qua (để ước tính skip time cho xe Bỏ Qua chưa có localStorage)
-    let maxNonSkippedMs = 0;
-    allWaiting.forEach((t) => {
-      const plateKey = t.plate.trim().toUpperCase();
-      if (typeof skippedMap[plateKey] !== 'number' && !isMarkedBoQua(t)) {
-        const ts = parseSheetDateTime(t.timestamp)?.getTime() || 0;
-        if (ts > maxNonSkippedMs) maxNonSkippedMs = ts;
-      }
-    });
-    if (maxNonSkippedMs === 0) maxNonSkippedMs = Date.now();
-
-    // Tính effective queue time cho mỗi xe.
-    // Duyệt allWaiting theo thứ tự sheet để boquaIndex ổn định, tránh sort không ổn định.
-    const effectiveTimes = new Map<string, number>();
-    let boquaIndex = 0;
-    allWaiting.forEach((t) => {
-      const plateKey = t.plate.trim().toUpperCase();
-
-      if (typeof skippedMap[plateKey] === 'number') {
-        // Có thời điểm bỏ qua thực tế từ localStorage / live diff — dùng trực tiếp
-        effectiveTimes.set(plateKey, skippedMap[plateKey]);
-      } else if (isMarkedBoQua(t)) {
-        // Xe "Bỏ Qua" nhưng chưa có localStorage: đặt cuối hàng theo thứ tự sheet
-        boquaIndex++;
-        effectiveTimes.set(plateKey, maxNonSkippedMs + boquaIndex * 1000);
-      } else {
-        // Xe thường: dùng timestamp đăng ký từ sheet
-        const parsed = parseSheetDateTime(t.timestamp);
-        effectiveTimes.set(plateKey, parsed ? parsed.getTime() : (t.arrivalTimeMs || 0));
-      }
-    });
-
-    // Sắp xếp theo effective queue time (tăng dần)
-    allWaiting.sort((a, b) => {
-      const timeA = effectiveTimes.get(a.plate.trim().toUpperCase()) || 0;
-      const timeB = effectiveTimes.get(b.plate.trim().toUpperCase()) || 0;
-      return timeA - timeB;
-    });
-
+    // Không sort — thứ tự dòng Google Sheet là nguồn chính xác
     return allWaiting;
   }, [trucks, priorityTrucks, docks, skippedOrderTick]);
 
