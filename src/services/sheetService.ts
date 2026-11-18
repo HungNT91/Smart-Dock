@@ -1175,11 +1175,12 @@ function parseGvizTableToHistory(table: any): HistoryRowData[] {
 
 /**
  * Lấy danh sách xe đang ở dock từ sheet "Lịch sử giao hàng":
- * - Lấy 15 dòng từ dưới lên (các dòng mới nhất ở cuối sheet).
- * - Nếu trong 15 dòng đó có trùng cửa giao hàng: lấy dòng mới nhất (dòng ở dưới hơn)
- *   và tự động lấy bù thêm các dòng ở trên cho đủ tối đa 15 dòng (15 cửa khác nhau).
- * - Đảm bảo các dock hiển thị đúng xe đang giao hàng.
- * - Chỉ không hiển thị khi đến 21:00 hàng ngày.
+ * - Chỉ lấy trong phạm vi NGÀY MỚI NHẤT (tuyệt đối không lấy dữ liệu các ngày cũ để lấp đầy dock).
+ * - Lấy tối đa 15 dòng từ dưới lên của đúng ngày mới nhất đó.
+ * - Nếu trong ngày đó có trùng cửa giao hàng: lấy dòng mới nhất (dòng ở dưới hơn)
+ *   và tự động lấy bù thêm các dòng ở trên (cùng ngày đó) cho đủ tối đa 15 dòng.
+ * - Nếu ngày đó chỉ có vài xe thì chỉ hiển thị bấy nhiêu xe, các dock khác để trống.
+ * - Sau 21:00 hàng ngày thì không hiển thị.
  */
 export function extractDockTrucksFromHistory(
   history: HistoryRowData[],
@@ -1194,11 +1195,43 @@ export function extractDockTrucksFromHistory(
     return dockMap;
   }
 
-  // Duyệt từ dưới lên (từ dòng cuối cùng của sheet Lịch sử giao hàng ngược lên đầu)
-  // Lấy tối đa 15 dòng (15 cửa khác nhau). Nếu trùng cửa, tự động duyệt tiếp lên trên để bù đủ 15 dòng.
+  const todayKey = getLocalDateKey(now);
+
+  // 1. Tìm ngày mới nhất có trong sheet Lịch sử giao hàng (dòng dưới cùng có timestamp)
+  let latestDateKey: string | null = null;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    const parsed = parseSheetDateTime(h.inTime) || parseSheetDateTime(h.timestamp);
+    if (parsed) {
+      latestDateKey = getLocalDateKey(parsed);
+      break;
+    }
+  }
+
+  // Nếu không có dữ liệu ngày hợp lệ thì không nạp
+  if (!latestDateKey) {
+    return dockMap;
+  }
+
+  // Nếu ngày mới nhất chính là hôm nay nhưng hiện tại đã qua 21:00 thì không hiển thị
+  if (latestDateKey === todayKey && now.getHours() >= cutoffHour) {
+    return dockMap;
+  }
+
+  // 2. Duyệt từ dưới lên, CHỈ TRONG PHẠM VI NGÀY MỚI NHẤT (latestDateKey)
+  // Tuyệt đối không lấy dữ liệu của các ngày cũ hơn để nhồi đầy các cửa dock.
   for (let i = history.length - 1; i >= 0 && dockMap.size < 15; i--) {
     const h = history[i];
     if (!h.plate || !h.dock) continue;
+
+    const parsed = parseSheetDateTime(h.inTime) || parseSheetDateTime(h.timestamp);
+    if (parsed) {
+      const itemDateKey = getLocalDateKey(parsed);
+      // Nếu đã lùi sang ngày cũ hơn ngày mới nhất -> DỪNG LẠI NGAY LẬP TỨC!
+      if (itemDateKey !== latestDateKey) {
+        break;
+      }
+    }
 
     const dockIndex = findDockIndexById(h.dock);
     if (dockIndex === null) continue;
@@ -1207,7 +1240,7 @@ export function extractDockTrucksFromHistory(
     // Nếu xe này đang nằm trong hàng đợi của Thông Tin Giao Hàng hoặc Ưu Tiên thì ưu tiên hàng đợi
     if (activeQueuePlates.has(normPlate)) continue;
 
-    // Nếu dock này đã có xe ở dòng mới hơn bên dưới -> bỏ qua, vòng lặp tự động lấy dòng phía trên bù vào
+    // Nếu dock này đã có xe ở dòng mới hơn bên dưới -> bỏ qua, vòng lặp tự động duyệt tiếp lên trên (cùng ngày) để bù
     if (dockMap.has(dockIndex)) continue;
 
     const dockDef = DOCK_DEFINITIONS[dockIndex];
