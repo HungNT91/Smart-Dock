@@ -721,17 +721,14 @@ export default function App() {
   }, [dataLoaded, syncConfig.mode, syncConfig.autoSync, syncConfig.gasWebAppUrl, syncConfig.sheetUrl, syncConfig.pollIntervalSec, syncWithGasLive]);
 
   // Derived state: Queue trucks
-  // FIFO Queue with Effective Queue Time:
-  // - A regular waiting truck enters the queue at its check-in timestamp.
-  // - A skipped truck (whether priority or active) joins the end of the line at the moment it was skipped.
-  // - As earlier trucks ahead of it are called to docks, the skipped truck naturally progresses forward
-  //   (e.g. advancing to Position #3).
-  // - Newer arriving trucks have later timestamps, so they line up behind it and never overlap or hide it.
+  // Thứ tự trên màn hình phản ánh đúng thứ tự hàng trong Google Sheet.
+  // - Xe từ sheet "Thông Tin Giao Hàng" được xếp trước (theo thứ tự dòng trong sheet).
+  // - Xe từ sheet "Ưu Tiên" xếp tiếp theo (theo thứ tự dòng trong sheet Ưu Tiên).
+  // - Xe bị Bỏ Qua vẫn giữ nguyên vị trí trong sheet, chỉ hiển thị marker bỏ qua.
   const queueTrucks = useMemo(() => {
-    const skippedMap = skippedOrderRef.current;
     const seenPlates = new Set<string>();
 
-    // Avoid showing duplicates if a plate is already actively assigned to a dock
+    // Loại bỏ xe đang được giao tại cửa dock khỏi hàng chờ
     docks.forEach((d) => {
       if (d.currentTruck?.plate) {
         seenPlates.add(d.currentTruck.plate.trim().toUpperCase());
@@ -740,6 +737,7 @@ export default function App() {
 
     const allWaiting: Truck[] = [];
 
+    // Giữ nguyên thứ tự dòng từ sheet "Thông Tin Giao Hàng"
     trucks.forEach((t) => {
       if (t.status !== 'waiting') return;
       const key = t.plate.trim().toUpperCase();
@@ -748,6 +746,7 @@ export default function App() {
       allWaiting.push(t);
     });
 
+    // Tiếp tục với xe từ sheet "Ưu Tiên" (nếu chưa có trong danh sách)
     priorityTrucks.forEach((t) => {
       if (t.status !== 'waiting') return;
       const key = t.plate.trim().toUpperCase();
@@ -756,59 +755,7 @@ export default function App() {
       allWaiting.push(t);
     });
 
-    let storageUpdated = false;
-
-    const getEffectiveQueueTime = (t: Truck): number => {
-      const plateKey = t.plate.trim().toUpperCase();
-
-      // 1. If explicit skip timestamp was recorded in skippedMap, use it
-      if (typeof skippedMap[plateKey] === 'number') {
-        return skippedMap[plateKey];
-      }
-
-      const notesUpper = (t.notes || '').toUpperCase();
-      const posUpper = (t.waitingPosition || '').toUpperCase();
-      const isMarkedSkip = /BỎ\s*QUA|BO\s*QUA/.test(notesUpper) || /BỎ\s*QUA|BO\s*QUA/.test(posUpper);
-
-      // 2. Specific known skip handling (e.g. cold reload before diff)
-      if (plateKey === '41D76896') {
-        // Priority truck 41D76896 was skipped at ~10:09 AM.
-        // Positions it right after 51D89458 (10:08:36) and ahead of 50H41678 (10:09:55), placing it at Position #3!
-        const parsed = parseSheetDateTime('18/11/2026 10:09:00')?.getTime() || (Date.now() - 3600000);
-        skippedMap[plateKey] = parsed;
-        storageUpdated = true;
-        return parsed;
-      }
-
-      if (isMarkedSkip) {
-        let skipTime: number;
-        if (plateKey === '50H14137') {
-          skipTime = parseSheetDateTime('18/11/2026 10:45:00')?.getTime() || (Date.now() - 1800000);
-        } else if (plateKey === '50H82061') {
-          skipTime = parseSheetDateTime('18/11/2026 10:50:00')?.getTime() || (Date.now() - 1500000);
-        } else {
-          const arrival = parseSheetDateTime(t.timestamp)?.getTime() || t.arrivalTimeMs || Date.now();
-          skipTime = arrival + 12000000;
-        }
-        skippedMap[plateKey] = skipTime;
-        storageUpdated = true;
-        return skipTime;
-      }
-
-      // 3. Regular waiting trucks: effective queue time is arrival timestamp
-      const parsedArrival = parseSheetDateTime(t.timestamp);
-      if (parsedArrival) {
-        return parsedArrival.getTime();
-      }
-      return t.arrivalTimeMs || 0;
-    };
-
-    allWaiting.sort((a, b) => getEffectiveQueueTime(a) - getEffectiveQueueTime(b));
-
-    if (storageUpdated) {
-      saveStoredSkippedOrder(skippedMap);
-    }
-
+    // Không sort — giữ đúng thứ tự hàng Google Sheet
     return allWaiting;
   }, [trucks, priorityTrucks, docks, skippedOrderTick]);
 
