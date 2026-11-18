@@ -42,7 +42,7 @@ export default function App() {
     sheetId: '',
     sheetName: 'Thông Tin Giao Hàng',
     autoSync: true,
-    pollIntervalSec: 2,
+    pollIntervalSec: 3,
     lastSyncedAt: new Date(),
     syncStatus: 'idle',
   });
@@ -106,11 +106,14 @@ export default function App() {
     }
   }, []);
 
-  // Save to localStorage when state changes
+  // Save to localStorage when state changes (debounced to avoid blocking main thread on every polling tick)
   useEffect(() => {
     if (!dataLoaded) return;
-    saveStoredData(trucks, priorityTrucks, docks, historyRows, syncConfig);
-  }, [trucks, priorityTrucks, docks, historyRows, syncConfig, dataLoaded]);
+    const timer = setTimeout(() => {
+      saveStoredData(trucks, priorityTrucks, docks, historyRows, syncConfig);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [trucks, priorityTrucks, docks, historyRows, syncConfig.mode, syncConfig.gasWebAppUrl, syncConfig.sheetUrl, dataLoaded]);
 
   // Dark mode toggle
   const handleToggleDarkMode = () => {
@@ -556,178 +559,89 @@ export default function App() {
       prevTrucksRef.current = liveTrucks;
       prevPriorityTrucksRef.current = livePriorityTrucks;
       prevHistoryRef.current = liveHistory;
-      setTrucks(liveTrucks);
-      setPriorityTrucks(livePriorityTrucks);
-      if (res.history && res.history.length > 0) {
-        setHistoryRows(res.history);
+
+      const trucksChanged =
+        liveTrucks.length !== prevTrucks.length ||
+        liveTrucks.some((t, i) => {
+          const p = prevTrucks[i];
+          return !p || p.plate !== t.plate || p.assignedDock !== t.assignedDock || p.callCount !== t.callCount;
+        });
+
+      const priorityChanged =
+        livePriorityTrucks.length !== prevPriorityTrucks.length ||
+        livePriorityTrucks.some((t, i) => {
+          const p = prevPriorityTrucks[i];
+          return !p || p.plate !== t.plate || p.assignedDock !== t.assignedDock || p.callCount !== t.callCount;
+        });
+
+      const historyChanged =
+        Boolean(res.history && res.history.length > 0) &&
+        (res.history.length !== prevHistory.length ||
+          res.history[0]?.plate !== prevHistory[0]?.plate ||
+          res.history[0]?.inTime !== prevHistory[0]?.inTime);
+
+      const hasStructuralChange =
+        trucksChanged ||
+        priorityChanged ||
+        newlyCalledPlates.size > 0 ||
+        newlyConfirmedPlates.size > 0 ||
+        skippedUpdated ||
+        isInitialSync;
+
+      if (hasStructuralChange) {
+        setTrucks(liveTrucks);
+        setPriorityTrucks(livePriorityTrucks);
+
+        const isDismissedCall = (plate?: string, dockStr?: string | null, callCount?: number) => {
+          if (!plate || !dockStr) return false;
+          const normPlate = plate.trim().toUpperCase();
+          const normDock = dockStr.trim().toUpperCase();
+          const count = Number(callCount) || 0;
+          return dismissed21hRef.current.some(
+            (e) => e.plate === normPlate && e.dock === normDock && e.callCount === count
+          );
+        };
+
+        // Re-map docks cleanly from active sheets (Thông Tin Giao Hàng & Ưu Tiên).
+        // Free docks remain free so departing trucks play their exit animation
+        // and arriving trucks play their entry animation.
+        setDocks((prevDocks) => {
+          return prevDocks.map((d) => {
+            const prioMatch = livePriorityTrucks.find(
+              (t) =>
+                t.dockId === d.index &&
+                !isDismissedCall(t.plate, t.assignedDock || d.id, t.callCount)
+            );
+            const activeMatch = liveTrucks.find(
+              (t) =>
+                t.dockId === d.index &&
+                !isDismissedCall(t.plate, t.assignedDock || d.id, t.callCount)
+            );
+            const matched = prioMatch || activeMatch;
+
+            if (matched) {
+              const plateKey = matched.plate.trim().toUpperCase();
+              const isNewlyCalled = newlyCalledPlates.has(plateKey);
+              return {
+                ...d,
+                currentTruck: isNewlyCalled ? { ...matched, status: 'moving' } : matched,
+                status: isNewlyCalled ? 'moving' : 'busy',
+              };
+            }
+
+            // No active truck assigned to this dock -> dock is free!
+            return {
+              ...d,
+              currentTruck: null,
+              status: d.status === 'maintenance' ? 'maintenance' : 'free',
+            };
+          });
+        });
       }
 
-      const isDismissedCall = (plate?: string, dockStr?: string | null, callCount?: number) => {
-        if (!plate || !dockStr) return false;
-        const normPlate = plate.trim().toUpperCase();
-        const normDock = dockStr.trim().toUpperCase();
-        const count = Number(callCount) || 0;
-        return dismissed21hRef.current.some(
-          (e) => e.plate === normPlate && e.dock === normDock && e.callCount === count
-        );
-      };
-
-      // Re-map docks from both "Thông Tin Giao Hàng" and "Ưu Tiên"
-      setDocks((prevDocks) => {
-        return prevDocks.map((d) => {
-          const prioMatch = livePriorityTrucks.find(
-            (t) =>
-              t.dockId === d.index &&
-              !isDismissedCall(t.plate, t.assignedDock || d.id, t.callCount)
-          );
-          const activeMatch = liveTrucks.find(
-            (t) =>
-              t.dockId === d.index &&
-              !isDismissedCall(t.plate, t.assignedDock || d.id, t.callCount)
-          );
-          const matched = prioMatch || activeMatch;
-
-          if (matched) {
-            const plateKey = matched.plate.trim().toUpperCase();
-            const isNewlyCalled = newlyCalledPlates.has(plateKey);
-            return {
-              ...d,
-              currentTruck: isNewlyCalled ? { ...matched, status: 'moving' } : matched,
-              status: isNewlyCalled ? 'moving' : 'busy',
-            };
-          }
-
-          // Check existing truck on dock
-          if (d.currentTruck) {
-            const isSkippedBackToQueue = allLiveTrucks.some(
-              (t) =>
-                t.plate.trim().toUpperCase() === d.currentTruck?.plate.trim().toUpperCase() &&
-                !t.assignedDock
-            );
-            if (isSkippedBackToQueue) {
-              return {
-                ...d,
-                currentTruck: null,
-                status: 'free',
-              };
-            }
-
-            if (
-              isDismissedCall(d.currentTruck.plate, d.currentTruck.assignedDock || d.id, d.currentTruck.callCount) ||
-              (isAfter21h && d.currentTruck.id.startsWith('HIST-'))
-            ) {
-              return {
-                ...d,
-                currentTruck: null,
-                status: d.status === 'maintenance' ? 'maintenance' : 'free',
-              };
-            }
-
-            // If dock holds a history-restored truck and a newer confirmed truck arrived at the same dock today, update it
-            if (!isAfter21h && d.currentTruck.id.startsWith('HIST-') && liveHistory.length > 0) {
-              const todayHistMatches = liveHistory.filter((h: HistoryRowData) => {
-                const pIdx = findDockIndexById(h.dock);
-                if (pIdx !== d.index) return false;
-                return isHistoryEntryTodayBeforeCutoff(h.inTime, h.timestamp, now, 21);
-              });
-              if (todayHistMatches.length > 0) {
-                const recentHist = todayHistMatches.reduce((latest, curr) => {
-                  const latestTs = (parseSheetDateTime(latest.inTime) || parseSheetDateTime(latest.timestamp))?.getTime() || 0;
-                  const currTs = (parseSheetDateTime(curr.inTime) || parseSheetDateTime(curr.timestamp))?.getTime() || 0;
-                  return currTs >= latestTs ? curr : latest;
-                });
-                const isWaitingInLive = allLiveTrucks.some(
-                  (t) =>
-                    t.plate.trim().toUpperCase() === recentHist.plate.trim().toUpperCase() &&
-                    !t.assignedDock
-                );
-                if (
-                  !isWaitingInLive &&
-                  recentHist.plate.trim().toUpperCase() !== d.currentTruck.plate.trim().toUpperCase()
-                ) {
-                  const histTruck: Truck = {
-                    id: `HIST-${recentHist.plate.trim().toUpperCase()}-${d.index}`,
-                    plate: recentHist.plate.trim().toUpperCase(),
-                    type: mapTypeNameToKey(recentHist.vehicleType),
-                    supplier: recentHist.notes || '',
-                    pallets: 10,
-                    assignedDock: d.id,
-                    checkInTime: recentHist.inTime || '',
-                    arrivalTimeMs: Date.now(),
-                    status: 'busy',
-                    dockId: d.index,
-                    callCount: Number(recentHist.callCount) || 1,
-                    priority: recentHist.priority,
-                    waitingPosition: recentHist.waitingPosition,
-                  };
-                  return {
-                    ...d,
-                    currentTruck: histTruck,
-                    status: 'busy',
-                  };
-                }
-              }
-            }
-
-            // Keep previously docked truck (from today) at dock until a new truck is assigned or 21:00 reset
-            return {
-              ...d,
-              status: 'busy',
-            };
-          }
-
-          // If dock was empty and it is strictly before 21:00, check today's history ONLY
-          if (!isAfter21h && liveHistory.length > 0) {
-            const todayHistMatches = liveHistory.filter((h: HistoryRowData) => {
-              const pIdx = findDockIndexById(h.dock);
-              if (pIdx !== d.index) return false;
-              return isHistoryEntryTodayBeforeCutoff(h.inTime, h.timestamp, now, 21);
-            });
-
-            if (todayHistMatches.length > 0) {
-              const recentHist = todayHistMatches.reduce((latest, curr) => {
-                const latestTs = (parseSheetDateTime(latest.inTime) || parseSheetDateTime(latest.timestamp))?.getTime() || 0;
-                const currTs = (parseSheetDateTime(curr.inTime) || parseSheetDateTime(curr.timestamp))?.getTime() || 0;
-                return currTs >= latestTs ? curr : latest;
-              });
-
-              const isWaitingInLive = allLiveTrucks.some(
-                (t) =>
-                  t.plate.trim().toUpperCase() === recentHist.plate.trim().toUpperCase() &&
-                  !t.assignedDock
-              );
-              if (!isWaitingInLive) {
-                const histTruck: Truck = {
-                  id: `HIST-${recentHist.plate.trim().toUpperCase()}-${d.index}`,
-                  plate: recentHist.plate.trim().toUpperCase(),
-                  type: mapTypeNameToKey(recentHist.vehicleType),
-                  supplier: recentHist.notes || '',
-                  pallets: 10,
-                  assignedDock: d.id,
-                  checkInTime: recentHist.inTime || '',
-                  arrivalTimeMs: Date.now(),
-                  status: 'busy',
-                  dockId: d.index,
-                  callCount: Number(recentHist.callCount) || 1,
-                  priority: recentHist.priority,
-                  waitingPosition: recentHist.waitingPosition,
-                };
-                return {
-                  ...d,
-                  currentTruck: histTruck,
-                  status: 'busy',
-                };
-              }
-            }
-          }
-
-          return {
-            ...d,
-            currentTruck: null,
-            status: d.status === 'maintenance' ? 'maintenance' : 'free',
-          };
-        });
-      });
+      if (historyChanged && res.history && res.history.length > 0) {
+        setHistoryRows(res.history);
+      }
 
       setSyncConfig((prev) => ({
         ...prev,
@@ -1149,16 +1063,12 @@ export default function App() {
 
       setHistoryRows((prev) => [newHistoryEntry, ...prev]);
 
-      // Keep previously docked truck at dock during daytime (< 21:00) until a new truck is assigned;
-      // after 21:00 let it drive out immediately.
+      // Free the dock immediately so the departing truck plays its drive-out animation
       if (truck.dockId !== undefined && truck.dockId !== null) {
-        const shouldClearImmediately = now.getHours() >= 21;
         setDocks((prev) =>
           prev.map((d) =>
             d.index === truck.dockId
-              ? shouldClearImmediately
-                ? { ...d, currentTruck: null, status: 'free' }
-                : { ...d, status: 'busy' }
+              ? { ...d, currentTruck: null, status: 'free' }
               : d
           )
         );

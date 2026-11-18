@@ -652,7 +652,7 @@ export function loadStoredData(): {
     sheetId: '1hfTZphz6FO8lIY8SMum94zgIx_WhEpwg5Oz4DFAGbwk',
     sheetName: 'Thông Tin Giao Hàng',
     autoSync: true,
-    pollIntervalSec: 2,
+    pollIntervalSec: 3,
     lastSyncedAt: new Date(),
     syncStatus: 'idle',
   };
@@ -693,7 +693,7 @@ export function loadStoredData(): {
       if (storedConfig) {
         const parsed = JSON.parse(storedConfig);
         // Merge stored config but preserve the new default sheetUrl/sheetId if not set
-        config = { ...config, ...parsed, pollIntervalSec: 2 };
+        config = { ...config, ...parsed, pollIntervalSec: 3 };
         // Normalize mode: if user explicitly chose 'simulator', keep it;
         // if localStorage has a gasWebAppUrl AND mode=gas_live, keep gas_live;
         // otherwise always fall back to sheet_direct with the configured sheetUrl.
@@ -734,7 +734,7 @@ export function loadStoredData(): {
     priorityTrucks = priorityTrucks.filter((t) => t.status === 'waiting');
   }
 
-  // Bind initial dock trucks (only if assigned today before 21:00)
+  // Bind initial dock trucks from active and priority queues only
   const dockMap = new Map<number, Dock>();
   docks.forEach((d) => {
     dockMap.set(d.index, {
@@ -757,49 +757,6 @@ export function loadStoredData(): {
           d.currentTruck = t;
           d.status = t.status === 'moving' ? 'moving' : 'busy';
           d.since = t.since || Date.now();
-        }
-      }
-    });
-
-    // Also restore today's confirmed trucks from "Lịch sử giao hàng" onto remaining free docks before 21:00
-    const allQueuePlates = new Set(
-      [...trucks, ...priorityTrucks]
-        .filter((t) => !t.assignedDock)
-        .map((t) => t.plate.trim().toUpperCase())
-    );
-    dockMap.forEach((d) => {
-      if (d.currentTruck || d.status === 'maintenance') return;
-      const todayHistMatches = history.filter((h) => {
-        const pIdx = findDockIndexById(h.dock);
-        if (pIdx !== d.index) return false;
-        return isHistoryEntryTodayBeforeCutoff(h.inTime, h.timestamp, now, 21);
-      });
-      if (todayHistMatches.length > 0) {
-        const recentHist = todayHistMatches.reduce((latest, curr) => {
-          const latestTs = (parseSheetDateTime(latest.inTime) || parseSheetDateTime(latest.timestamp))?.getTime() || 0;
-          const currTs = (parseSheetDateTime(curr.inTime) || parseSheetDateTime(curr.timestamp))?.getTime() || 0;
-          return currTs >= latestTs ? curr : latest;
-        });
-        if (!allQueuePlates.has(recentHist.plate.trim().toUpperCase())) {
-          const histTs = (parseSheetDateTime(recentHist.inTime) || parseSheetDateTime(recentHist.timestamp))?.getTime() || Date.now();
-          d.currentTruck = {
-            id: `HIST-${recentHist.plate}-${d.index}`,
-            plate: recentHist.plate,
-            type: mapTypeNameToKey(recentHist.vehicleType),
-            supplier: recentHist.notes || '',
-            pallets: 10,
-            assignedDock: d.id,
-            checkInTime: recentHist.inTime || '',
-            arrivalTimeMs: histTs,
-            status: 'busy',
-            since: histTs,
-            dockId: d.index,
-            callCount: Number(recentHist.callCount) || 1,
-            priority: recentHist.priority,
-            waitingPosition: recentHist.waitingPosition,
-          };
-          d.status = 'busy';
-          d.since = histTs;
         }
       }
     });

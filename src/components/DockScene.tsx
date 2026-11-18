@@ -470,12 +470,13 @@ export const DockScene: React.FC<DockSceneProps> = ({
     [docks, onCallTruckToDock]
   );
 
-  // RAF loop for trucks — physics runs at full 60fps, React re-render throttled to ~20fps
+  // RAF loop for trucks — physics runs at full 60fps, React re-render throttled to ~30fps when moving
   useEffect(() => {
     let active = true;
     let lastReactRender = 0;
-    const REACT_FPS = 20; // ms between React re-renders
+    const REACT_FPS = 30; // 30fps is very smooth and keeps CPU usage low
     const REACT_INTERVAL = 1000 / REACT_FPS;
+    let wasMoving = false;
 
     const frameStep = (now: number) => {
       if (!active) return;
@@ -517,12 +518,17 @@ export const DockScene: React.FC<DockSceneProps> = ({
         }
       });
 
-      // Only trigger React re-render at ~20fps, or immediately when animation finishes
-      if (anyMoving && now - lastReactRender >= REACT_INTERVAL) {
-        lastReactRender = now;
-        setRenderTrigger((prev) => prev + 1);
-      } else if (!anyMoving) {
-        // No vehicles moving — still need one final render after finish
+      // ONLY trigger React re-render when a vehicle is moving (throttled to 30fps),
+      // plus exactly ONE final render when movement stops to settle at the final pose.
+      // When vehicles are stationary, CPU/GPU load is 0%.
+      if (anyMoving) {
+        wasMoving = true;
+        if (now - lastReactRender >= REACT_INTERVAL) {
+          lastReactRender = now;
+          setRenderTrigger((prev) => prev + 1);
+        }
+      } else if (wasMoving) {
+        wasMoving = false;
         setRenderTrigger((prev) => prev + 1);
       }
 
