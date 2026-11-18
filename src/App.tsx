@@ -183,6 +183,8 @@ export default function App() {
   const dismissed21hRef = useRef<DismissedCallEntry[]>(loadDismissed21hCalls());
   const [gasHasPrioritySupport, setGasHasPrioritySupport] = useState<boolean | null>(null);
   const warnedMissingPriorityGasRef = useRef(false);
+  const isSyncingRef = useRef(false);
+  const lastSyncedAtRef = useRef<Date | null>(null);
 
   useEffect(() => {
     warnedMissingPriorityGasRef.current = false;
@@ -301,6 +303,10 @@ export default function App() {
     const isDirectSheet = syncConfig.mode === 'sheet_direct';
     const activeUrl = isDirectSheet ? (syncConfig.sheetUrl || syncConfig.gasWebAppUrl) : syncConfig.gasWebAppUrl;
     if (!activeUrl) return;
+
+    // Concurrency guard: avoid launching overlapping requests if previous poll is still in flight
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
 
     try {
       const res = isDirectSheet
@@ -664,18 +670,28 @@ export default function App() {
         setHistoryRows(res.history);
       }
 
-      setSyncConfig((prev) => ({
-        ...prev,
-        lastSyncedAt: new Date(),
-        syncStatus: 'connected',
-        errorMessage: undefined,
-      }));
+      lastSyncedAtRef.current = new Date();
+      // Only trigger React state update if sync status actually changed,
+      // avoiding useless App re-renders every 3 seconds when everything is calm!
+      setSyncConfig((prev) => {
+        if (prev.syncStatus === 'connected' && !prev.errorMessage && prev.lastSyncedAt) {
+          return prev;
+        }
+        return {
+          ...prev,
+          lastSyncedAt: lastSyncedAtRef.current || new Date(),
+          syncStatus: 'connected',
+          errorMessage: undefined,
+        };
+      });
     } catch (err: any) {
       setSyncConfig((prev) => ({
         ...prev,
         syncStatus: 'error',
         errorMessage: err.message,
       }));
+    } finally {
+      isSyncingRef.current = false;
     }
   }, [syncConfig.mode, syncConfig.gasWebAppUrl, syncConfig.sheetUrl, syncConfig.sheetName, soundEnabled, showToast, clearDismissedForPlate]);
 
@@ -1110,11 +1126,19 @@ export default function App() {
   );
 
   // Complete unloading directly from DockScene
-  const handleCompleteUnloading = (dockIndex: number) => {
-    const dock = docks[dockIndex];
+  const handleCompleteUnloading = useCallback((dockIndex: number) => {
+    const dock = docksRef.current[dockIndex];
     if (!dock || !dock.currentTruck) return;
     handleConfirmArrivalToHistory(dock.currentTruck.plate);
-  };
+  }, [handleConfirmArrivalToHistory]);
+
+  const handleSelectDock = useCallback((idx: number) => {
+    setSelectedDockId(idx);
+  }, []);
+
+  const handleSelectTruck = useCallback((id: string | null) => {
+    setSelectedTruckId(id);
+  }, []);
 
   const [triggerNewArrival, setTriggerNewArrival] = useState<Truck | null>(null);
 
@@ -1326,17 +1350,17 @@ export default function App() {
           waitingQueueCount={waitingQueueColHCount}
           selectedDockId={selectedDockId}
           selectedTruckId={selectedTruckId}
-          onSelectDock={(idx) => setSelectedDockId(idx)}
-          onSelectTruck={(id) => setSelectedTruckId(id)}
+          onSelectDock={handleSelectDock}
+          onSelectTruck={handleSelectTruck}
           onCallTruckToDock={handleCallTruckToDock}
           onCompleteUnload={handleCompleteUnloading}
           triggerNewArrival={triggerNewArrival}
         />
       </main>
 
-      {/* Bottom 60px Marquee Ticker (text begins emerging at Stall 14 / ô 14 ~56% from left, right edge fades 60px leftward) */}
+      {/* Bottom 60px Marquee Ticker (Optimized: solid background + CSS gradient overlay, 0 GPU mask-image/blur lag) */}
       <div
-        className="fixed bottom-0 left-0 z-30 h-[60px] w-[56%] max-w-full overflow-hidden bg-slate-950/90 backdrop-blur-md border-t-2 border-[#ff6b00]/80 shadow-[0_-6px_24px_rgba(15,23,42,0.35)] flex items-center pointer-events-none marquee-fade-right"
+        className="fixed bottom-0 left-0 z-30 h-[60px] w-[56%] max-w-full overflow-hidden bg-slate-950/95 border-t-2 border-[#ff6b00]/80 shadow-[0_-6px_24px_rgba(15,23,42,0.35)] flex items-center pointer-events-none"
         role="region"
         aria-label="Thông báo hướng dẫn nhà cung cấp"
       >
@@ -1358,6 +1382,8 @@ export default function App() {
           <span className="text-slate-400 mx-1">-</span>
           <span className="text-slate-300 font-semibold">© Copyright by Nguyễn Tiến Hưng</span>
         </div>
+        {/* Right edge fade gradient (GPU friendly pure CSS overlay) */}
+        <div className="absolute right-0 top-0 bottom-0 w-16 bg-gradient-to-l from-slate-950 to-transparent pointer-events-none" />
       </div>
 
       {/* Google Sheets & Apps Script Modal */}

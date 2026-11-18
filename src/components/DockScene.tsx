@@ -30,6 +30,8 @@ interface ActiveTruckState {
   spot?: number;
   assignedDockIndex?: number;
   onFinish?: () => void;
+  cachedPoseKey?: string;
+  cachedSvgHtml?: string;
 }
 
 interface DockSceneProps {
@@ -57,7 +59,7 @@ const computeDailyWeather = (): WeatherMode => {
   return 'clear';
 };
 
-export const DockScene: React.FC<DockSceneProps> = ({
+export const DockScene = React.memo<DockSceneProps>(({
   docks,
   queueTrucks,
   waitingQueueCount,
@@ -819,7 +821,7 @@ export const DockScene: React.FC<DockSceneProps> = ({
     return { ground: bg, wall };
   }, []);
 
-  const handleDockClick = (dockIndex: number) => {
+  const handleDockClick = useCallback((dockIndex: number) => {
     if (selectedTruckId) {
       animateCallTruckToDock(dockIndex, selectedTruckId);
     } else {
@@ -845,7 +847,176 @@ export const DockScene: React.FC<DockSceneProps> = ({
         onSelectDock(dockIndex);
       }
     }
-  };
+  }, [docks, selectedTruckId, queueTrucks, animateCallTruckToDock, onCompleteUnload, onSelectDock]);
+
+  // Memoize the 16 Industrial Dock Bays so that 160+ SVG polygons are NOT recomputed on every 30fps animation frame
+  const renderedDockBays = useMemo(() => {
+    return docks.map((dock) => {
+      const isSelected = selectedDockId === dock.index;
+      const cx = dock.cx;
+      const isFree = dock.status === 'free';
+      const isBusy = dock.status === 'busy';
+      const isMoving = dock.status === 'moving';
+
+      const statusColor = isFree
+        ? '#0d9488'
+        : isMoving
+        ? '#f59e0b'
+        : dock.status === 'maintenance'
+        ? '#94a3b8'
+        : '#2563eb';
+
+      // Dock Staging Guide Line on Ground
+      const floorPad = renderPolygon3D(
+        [
+          [cx - 25, 0, 0.1],
+          [cx + 25, 0, 0.1],
+          [cx + 25, 170, 0.1],
+          [cx - 25, 170, 0.1],
+        ],
+        statusColor,
+        isSelected ? '#0d9488' : '#cbd5e1',
+        `fill-opacity="${isFree ? 0.08 : 0.16}" stroke-width="${isSelected ? 3 : 1.2}" stroke-dasharray="6 4"`
+      );
+
+      // Dynamic Sectional Overhead Door:
+      // When a truck is docked (isBusy), the door rolls UP revealing the illuminated warehouse interior!
+      const doorHeight = isBusy ? 14 : 72;
+      let doorSvg = '';
+      doorSvg += renderPolygon3D(
+        [
+          [cx - 23, 0, 72 - doorHeight],
+          [cx + 23, 0, 72 - doorHeight],
+          [cx + 23, 0, 72],
+          [cx - 23, 0, 72],
+        ],
+        '#ffffff',
+        '#cbd5e1',
+        'stroke-width="1.5"'
+      );
+
+      // Door ribs and vision windows if door is down
+      if (!isBusy) {
+        for (let dz = 18; dz <= 54; dz += 18) {
+          doorSvg += renderPolygon3D(
+            [
+              [cx - 22, 0, dz],
+              [cx + 22, 0, dz],
+              [cx + 22, 0, dz + 1],
+              [cx - 22, 0, dz + 1],
+            ],
+            '#e2e8f0'
+          );
+        }
+        [-14, 0, 14].forEach((wx) => {
+          doorSvg += renderPolygon3D(
+            [
+              [cx + wx - 5, 0.2, 38],
+              [cx + wx + 5, 0.2, 38],
+              [cx + wx + 5, 0.2, 46],
+              [cx + wx - 5, 0.2, 46],
+            ],
+            '#0f172a',
+            '#94a3b8'
+          );
+        });
+      }
+
+      // Hydraulic Dock Leveler Platform
+      const leveler = renderBox3D(cx - 15, -4, 0, 30, 4, 18, '#ffffff', '#cbd5e1', '#0d9488');
+
+      // Heavy Molded Rubber Dock Bumpers
+      const bumperL = renderBox3D(cx - 20, 0, 6, 4, 3, 14, '#18181b', '#27272a', '#0f172a');
+      const bumperR = renderBox3D(cx + 16, 0, 6, 4, 3, 14, '#18181b', '#27272a', '#0f172a');
+
+      // Dock Traffic Signal Light Column
+      const [sigX, sigY] = isoPoint(cx + 25, 0, 52);
+      const [plaqueX, plaqueY] = isoPoint(cx, 0, 84);
+
+      return (
+        <g key={dock.id} id={`dock-group-${dock.index}`}>
+          <g dangerouslySetInnerHTML={{ __html: floorPad + doorSvg + leveler + bumperL + bumperR }} />
+
+          {/* Dual-Lens Dock Traffic Signal Box */}
+          <g transform={`translate(${sigX}, ${sigY})`}>
+            <rect x="-5" y="-14" width="10" height="28" rx="3" fill="#ffffff" stroke="#cbd5e1" strokeWidth="1" />
+            <circle
+              cx="0"
+              cy="-7"
+              r="3.5"
+              fill={isBusy ? '#ef4444' : '#fee2e2'}
+              stroke={isBusy ? '#dc2626' : '#fca5a5'}
+              strokeWidth="0.8"
+            />
+            <circle
+              cx="0"
+              cy="7"
+              r="3.5"
+              fill={isFree ? '#10b981' : '#d1fae5'}
+              stroke={isFree ? '#059669' : '#6ee7b7'}
+              strokeWidth="0.8"
+            />
+          </g>
+
+          {/* Clean Dock Bay Sign Plaque */}
+          <rect
+            x={plaqueX - 16}
+            y={plaqueY - 10}
+            width="32"
+            height="20"
+            rx="4"
+            fill={isSelected ? '#0d9488' : '#ffffff'}
+            stroke={statusColor}
+            strokeWidth="2"
+          />
+          <text
+            x={plaqueX}
+            y={plaqueY + 4.5}
+            textAnchor="middle"
+            fontSize="11.5"
+            fontWeight="900"
+            fill={isSelected ? '#ffffff' : '#0f172a'}
+            fontFamily="'JetBrains Mono', monospace"
+          >
+            {dock.id}
+          </text>
+        </g>
+      );
+    });
+  }, [docks, selectedDockId]);
+
+  // Memoize Interactive Hit Targets for Docks
+  const renderedHitTargets = useMemo(() => {
+    return docks.map((dock) => {
+      const cx = dock.cx;
+      const points = [
+        isoPoint(cx - 26, 0, 80),
+        isoPoint(cx + 26, 0, 80),
+        isoPoint(cx + 26, 170, 0),
+        isoPoint(cx - 26, 170, 0),
+      ]
+        .map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`)
+        .join(' ');
+
+      return (
+        <polygon
+          key={`hit-${dock.id}`}
+          points={points}
+          className="fill-transparent hover:fill-teal-500/15 cursor-pointer focus:outline-none transition-colors"
+          tabIndex={0}
+          role="button"
+          aria-label={`Dock ${dock.id} - ${dock.status}`}
+          onClick={() => handleDockClick(dock.index)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              handleDockClick(dock.index);
+            }
+          }}
+        />
+      );
+    });
+  }, [docks, handleDockClick]);
 
   const activeVehiclesList = Array.from(vehiclesRef.current.values()).sort(
     (a, b) => a.pose.x + a.pose.y - (b.pose.x + b.pose.y)
@@ -878,146 +1049,23 @@ export const DockScene: React.FC<DockSceneProps> = ({
         {/* Warehouse Facade Wall */}
         <g dangerouslySetInnerHTML={{ __html: staticSceneSvg.wall }} />
 
-        {/* 16 Modern Industrial Dock Bays */}
-        {docks.map((dock) => {
-          const isSelected = selectedDockId === dock.index;
-          const cx = dock.cx;
-          const isFree = dock.status === 'free';
-          const isBusy = dock.status === 'busy';
-          const isMoving = dock.status === 'moving';
+        {/* 16 Modern Industrial Dock Bays (Memoized for high FPS) */}
+        {renderedDockBays}
 
-          const statusColor = isFree
-            ? '#0d9488'
-            : isMoving
-            ? '#f59e0b'
-            : dock.status === 'maintenance'
-            ? '#94a3b8'
-            : '#2563eb';
-
-          // Dock Staging Guide Line on Ground
-          const floorPad = renderPolygon3D(
-            [
-              [cx - 25, 0, 0.1],
-              [cx + 25, 0, 0.1],
-              [cx + 25, 170, 0.1],
-              [cx - 25, 170, 0.1],
-            ],
-            statusColor,
-            isSelected ? '#0d9488' : '#cbd5e1',
-            `fill-opacity="${isFree ? 0.08 : 0.16}" stroke-width="${isSelected ? 3 : 1.2}" stroke-dasharray="6 4"`
-          );
-
-          // Dynamic Sectional Overhead Door:
-          // When a truck is docked (isBusy), the door rolls UP revealing the illuminated warehouse interior!
-          const doorHeight = isBusy ? 14 : 72;
-          let doorSvg = '';
-          doorSvg += renderPolygon3D(
-            [
-              [cx - 23, 0, 72 - doorHeight],
-              [cx + 23, 0, 72 - doorHeight],
-              [cx + 23, 0, 72],
-              [cx - 23, 0, 72],
-            ],
-            '#ffffff',
-            '#cbd5e1',
-            'stroke-width="1.5"'
-          );
-
-          // Door ribs and vision windows if door is down
-          if (!isBusy) {
-            for (let dz = 18; dz <= 54; dz += 18) {
-              doorSvg += renderPolygon3D(
-                [
-                  [cx - 22, 0, dz],
-                  [cx + 22, 0, dz],
-                  [cx + 22, 0, dz + 1],
-                  [cx - 22, 0, dz + 1],
-                ],
-                '#e2e8f0'
-              );
-            }
-            [-14, 0, 14].forEach((wx) => {
-              doorSvg += renderPolygon3D(
-                [
-                  [cx + wx - 5, 0.2, 38],
-                  [cx + wx + 5, 0.2, 38],
-                  [cx + wx + 5, 0.2, 46],
-                  [cx + wx - 5, 0.2, 46],
-                ],
-                '#0f172a',
-                '#94a3b8'
-              );
-            });
-          }
-
-          // Hydraulic Dock Leveler Platform
-          const leveler = renderBox3D(cx - 15, -4, 0, 30, 4, 18, '#ffffff', '#cbd5e1', '#0d9488');
-
-          // Heavy Molded Rubber Dock Bumpers
-          const bumperL = renderBox3D(cx - 20, 0, 6, 4, 3, 14, '#18181b', '#27272a', '#0f172a');
-          const bumperR = renderBox3D(cx + 16, 0, 6, 4, 3, 14, '#18181b', '#27272a', '#0f172a');
-
-          // Dock Traffic Signal Light Column
-          const [sigX, sigY] = isoPoint(cx + 25, 0, 52);
-          const [plaqueX, plaqueY] = isoPoint(cx, 0, 84);
-
-          return (
-            <g key={dock.id} id={`dock-group-${dock.index}`}>
-              <g dangerouslySetInnerHTML={{ __html: floorPad + doorSvg + leveler + bumperL + bumperR }} />
-
-              {/* Dual-Lens Dock Traffic Signal Box */}
-              <g transform={`translate(${sigX}, ${sigY})`}>
-                <rect x="-5" y="-14" width="10" height="28" rx="3" fill="#ffffff" stroke="#cbd5e1" strokeWidth="1" />
-                <circle
-                  cx="0"
-                  cy="-7"
-                  r="3.5"
-                  fill={isBusy ? '#ef4444' : '#fee2e2'}
-                  stroke={isBusy ? '#dc2626' : '#fca5a5'}
-                  strokeWidth="0.8"
-                />
-                <circle
-                  cx="0"
-                  cy="7"
-                  r="3.5"
-                  fill={isFree ? '#10b981' : '#d1fae5'}
-                  stroke={isFree ? '#059669' : '#6ee7b7'}
-                  strokeWidth="0.8"
-                />
-              </g>
-
-              {/* Clean Dock Bay Sign Plaque */}
-              <rect
-                x={plaqueX - 16}
-                y={plaqueY - 10}
-                width="32"
-                height="20"
-                rx="4"
-                fill={isSelected ? '#0d9488' : '#ffffff'}
-                stroke={statusColor}
-                strokeWidth="2"
-              />
-              <text
-                x={plaqueX}
-                y={plaqueY + 4.5}
-                textAnchor="middle"
-                fontSize="11.5"
-                fontWeight="900"
-                fill={isSelected ? '#ffffff' : '#0f172a'}
-                fontFamily="'JetBrains Mono', monospace"
-              >
-                {dock.id}
-              </text>
-            </g>
-          );
-        })}
-
-        {/* Animated Realistic Vehicles (Sorted by depth) */}
+        {/* Animated Realistic Vehicles (Sorted by depth, cached for stationary trucks) */}
         {activeVehiclesList.map((vehicle) => {
           const { truck, pose, opacity, mode, id } = vehicle;
           const isSelected = selectedTruckId === id;
           const config = VEHICLE_CONFIGS[truck.type] || VEHICLE_CONFIGS.small;
-          const truckSvgHtml = generateTruckFaces(truck, pose);
+          
+          // Cache 3D geometry for stationary trucks (saves trigonometry and DOM creation for ~19 trucks per frame)
+          const poseKey = `${pose.x.toFixed(1)}_${pose.y.toFixed(1)}_${pose.th.toFixed(2)}_${truck.plate}_${truck.type}`;
+          let truckSvgHtml = vehicle.cachedSvgHtml;
+          if (!truckSvgHtml || vehicle.cachedPoseKey !== poseKey) {
+            truckSvgHtml = generateTruckFaces(truck, pose);
+            vehicle.cachedSvgHtml = truckSvgHtml;
+            vehicle.cachedPoseKey = poseKey;
+          }
           const [tagX, tagY] = isoPoint(pose.x, pose.y, 10 + config.heightBody);
 
           return (
@@ -1177,40 +1225,14 @@ export const DockScene: React.FC<DockSceneProps> = ({
           );
         })()}
 
-        {/* Interactive Hit Targets for Docks */}
-        {docks.map((dock) => {
-          const cx = dock.cx;
-          const points = [
-            isoPoint(cx - 26, 0, 80),
-            isoPoint(cx + 26, 0, 80),
-            isoPoint(cx + 26, 170, 0),
-            isoPoint(cx - 26, 170, 0),
-          ]
-            .map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`)
-            .join(' ');
-
-          return (
-            <polygon
-              key={`hit-${dock.id}`}
-              points={points}
-              className="fill-transparent hover:fill-teal-500/15 cursor-pointer focus:outline-none transition-colors"
-              tabIndex={0}
-              role="button"
-              aria-label={`Dock ${dock.id} - ${dock.status}`}
-              onClick={() => handleDockClick(dock.index)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  handleDockClick(dock.index);
-                }
-              }}
-            />
-          );
-        })}
+        {/* Interactive Hit Targets for Docks (Memoized) */}
+        {renderedHitTargets}
       </svg>
 
       {/* Real-time Weather Atmospheric Particle Canvas (Rain / Dust Mist) */}
       <WeatherOverlay mode={weatherMode} />
     </div>
   );
-};
+});
+
+DockScene.displayName = 'DockScene';

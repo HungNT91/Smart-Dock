@@ -799,7 +799,9 @@ export function saveStoredData(
     localStorage.setItem(STORAGE_KEY_TRUCKS, JSON.stringify(trucks));
     localStorage.setItem(STORAGE_KEY_PRIORITY_TRUCKS, JSON.stringify(priorityTrucks));
     localStorage.setItem(STORAGE_KEY_DOCKS, JSON.stringify(docks));
-    localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(history));
+    // Limit stored history to last 100 rows to prevent localStorage lag/freeze
+    const cappedHistory = history.length > 100 ? history.slice(-100) : history;
+    localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(cappedHistory));
     localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(config));
   } catch (e) {
     console.warn('Error saving to localStorage', e);
@@ -886,6 +888,20 @@ export function extractSheetId(urlOrId: string): string {
 }
 
 /**
+ * Fetch with an explicit timeout to prevent hanging connections from piling up in background polling
+ */
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+/**
  * Returns true when running on a backend-capable dev/prod server (localhost or same-origin Express).
  * Returns false on static hosting like GitHub Pages where /api/* routes don't exist.
  */
@@ -911,7 +927,7 @@ async function fetchGvizTable(sheetId: string, sheetName?: string): Promise<any 
         url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
       });
       if (sheetName) proxyParams.set('sheetName', sheetName);
-      const res = await fetch(`/api/gas-proxy?${proxyParams.toString()}`);
+      const res = await fetchWithTimeout(`/api/gas-proxy?${proxyParams.toString()}`, {}, 6000);
       if (res.ok) {
         const data = await res.json();
         if (data.status === 'error' && data.errors && data.errors.length > 0) {
@@ -928,7 +944,7 @@ async function fetchGvizTable(sheetId: string, sheetName?: string): Promise<any 
 
   // 2. Direct gviz fetch — always used on GitHub Pages; fallback on localhost
   try {
-    const res = await fetch(gvizUrl, { mode: 'cors' });
+    const res = await fetchWithTimeout(gvizUrl, { mode: 'cors' }, 7000);
     const text = await res.text();
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
@@ -1292,23 +1308,27 @@ export async function fetchFromGasWebApp(
 
   let data: any = null;
 
-  // Try via server proxy first
-  try {
-    const proxyRes = await fetch(`/api/gas-proxy?url=${encodeURIComponent(targetUrl)}`);
-    const proxyJson = await proxyRes.json();
-    if (!proxyRes.ok) {
-      throw new Error(proxyJson.error || `HTTP ${proxyRes.status}`);
-    }
-    data = proxyJson;
-  } catch (proxyErr: any) {
-    // If it's a specific informative error from proxy, re-throw it
-    if (proxyErr.message && (proxyErr.message.includes('Apps Script') || proxyErr.message.includes('đăng nhập'))) {
-      throw proxyErr;
-    }
-
-    // Direct fallback
+  // Try via server proxy first ONLY on backend-capable hosts
+  if (hasBackendProxy()) {
     try {
-      const directRes = await fetch(targetUrl, { mode: 'cors', redirect: 'follow' });
+      const proxyRes = await fetchWithTimeout(`/api/gas-proxy?url=${encodeURIComponent(targetUrl)}`, {}, 6000);
+      const proxyJson = await proxyRes.json();
+      if (!proxyRes.ok) {
+        throw new Error(proxyJson.error || `HTTP ${proxyRes.status}`);
+      }
+      data = proxyJson;
+    } catch (proxyErr: any) {
+      // If it's a specific informative error from proxy, re-throw it
+      if (proxyErr.message && (proxyErr.message.includes('Apps Script') || proxyErr.message.includes('đăng nhập'))) {
+        throw proxyErr;
+      }
+    }
+  }
+
+  // Direct fallback (always used on GitHub Pages / static hosting)
+  if (!data) {
+    try {
+      const directRes = await fetchWithTimeout(targetUrl, { mode: 'cors', redirect: 'follow' }, 7000);
       if (!directRes.ok) throw new Error(`HTTP ${directRes.status}: ${directRes.statusText}`);
       data = await directRes.json();
     } catch {
@@ -1372,14 +1392,24 @@ export async function fetchFromGasWebApp(
 export async function callTruckViaGas(url: string, plate: string, dock: string) {
   if (!url) return;
   try {
-    await fetch('/api/gas-proxy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url,
-        data: { action: 'callTruck', plate, dock },
-      }),
-    });
+    if (hasBackendProxy()) {
+      await fetchWithTimeout('/api/gas-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          data: { action: 'callTruck', plate, dock },
+        }),
+      }, 5000);
+    } else {
+      // Direct POST to Google Apps Script Web App
+      await fetchWithTimeout(url, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'callTruck', plate, dock }),
+      }, 5000);
+    }
   } catch (e) {
     console.warn('Call truck GAS sync failed', e);
   }
@@ -1391,14 +1421,24 @@ export async function callTruckViaGas(url: string, plate: string, dock: string) 
 export async function confirmArrivalViaGas(url: string, plate: string) {
   if (!url) return;
   try {
-    await fetch('/api/gas-proxy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url,
-        data: { action: 'confirmArrival', plate },
-      }),
-    });
+    if (hasBackendProxy()) {
+      await fetchWithTimeout('/api/gas-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          data: { action: 'confirmArrival', plate },
+        }),
+      }, 5000);
+    } else {
+      // Direct POST to Google Apps Script Web App
+      await fetchWithTimeout(url, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'confirmArrival', plate }),
+      }, 5000);
+    }
   } catch (e) {
     console.warn('Confirm arrival GAS sync failed', e);
   }

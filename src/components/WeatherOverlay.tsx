@@ -45,11 +45,15 @@ interface MistPuff {
 
 export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Keep mode in a ref so the render loop always sees the latest value
-  // without needing to restart the loop on every mode change.
+  // Keep mode in a ref and trigger wake-up if transitioning from clear
   const modeRef = useRef<WeatherMode>(mode);
+  const wakeUpRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
     modeRef.current = mode;
+    if (wakeUpRef.current) {
+      wakeUpRef.current();
+    }
   }, [mode]);
 
   useEffect(() => {
@@ -59,14 +63,15 @@ export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
     if (!ctx) return;
     const safeCtx = ctx; // narrowed, non-null alias for use inside nested functions
 
-    let animId: number;
+    let animId: number | null = null;
+    let isRunning = false;
     let width = 0;
     let height = 0;
     let dpr = 1;
 
     // ── Particle state (allocated once, reused across mode changes) ────────
-    const RAIN_COUNT = 110;
-    const DUST_COUNT = 45;
+    const RAIN_COUNT = 90;
+    const DUST_COUNT = 35;
 
     const rainDrops: RainDrop[] = [];
     const ripples: SplashRipple[] = [];
@@ -133,7 +138,26 @@ export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
     // ── Render loop ──────────────────────────────────────────────────────────
     let lastTime = performance.now();
 
+    const startLoop = () => {
+      if (isRunning) return;
+      isRunning = true;
+      lastTime = performance.now();
+      animId = requestAnimationFrame(render);
+    };
+
+    wakeUpRef.current = startLoop;
+
     const render = (now: number) => {
+      const currentMode = modeRef.current;
+
+      // When weather is 'clear', clear canvas once and sleep completely (0% CPU/GPU)
+      if (currentMode === 'clear') {
+        safeCtx.clearRect(0, 0, width, height);
+        isRunning = false;
+        animId = null;
+        return;
+      }
+
       const rawDt = (now - lastTime) / 1000;
       lastTime = now;
       // Cap dt so a tab-switch / GC pause can't cause a huge jump
@@ -141,26 +165,24 @@ export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
 
       safeCtx.clearRect(0, 0, width, height);
 
-      const currentMode = modeRef.current;
-
       if (currentMode === 'rain') {
         const angleFactor = 0.3;
         ctx.lineCap = 'round';
+        ctx.lineWidth = 1.1;
+        ctx.strokeStyle = 'rgba(224,242,254,0.36)';
 
+        // Batch all raindrop lines into a single path -> 1 GPU draw call instead of 110
+        ctx.beginPath();
         for (let i = 0; i < rainDrops.length; i++) {
           const d = rainDrops[i];
           const step = d.speed * dt * 60;
           d.y += step;
           d.x += step * angleFactor;
 
-          ctx.beginPath();
-          ctx.lineWidth = d.thickness;
-          ctx.strokeStyle = `rgba(224,242,254,${d.opacity})`;
           ctx.moveTo(d.x, d.y);
           ctx.lineTo(d.x - d.len * angleFactor, d.y - d.len);
-          ctx.stroke();
 
-          if (d.y > height * 0.42 && Math.random() < 0.028 && ripples.length < 28) {
+          if (d.y > height * 0.42 && Math.random() < 0.025 && ripples.length < 24) {
             ripples.push({ x: d.x, y: d.y, r: 1.5, maxR: 5.5 + Math.random() * 4.5, opacity: 0.35 });
           }
 
@@ -169,18 +191,21 @@ export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
             d.x = Math.random() * (width + 100) - 80;
           }
         }
+        ctx.stroke();
 
         // Ripples — drawn without shadow, cheap ellipses
-        ctx.lineWidth = 1;
-        for (let i = ripples.length - 1; i >= 0; i--) {
-          const rip = ripples[i];
-          rip.r += 12 * dt;
-          rip.opacity -= 0.75 * dt;
-          if (rip.opacity <= 0 || rip.r >= rip.maxR) { ripples.splice(i, 1); continue; }
-          ctx.beginPath();
-          ctx.ellipse(rip.x, rip.y, rip.r * 1.5, rip.r * 0.75, 0, 0, Math.PI * 2);
-          ctx.strokeStyle = `rgba(224,242,254,${Math.max(0, rip.opacity)})`;
-          ctx.stroke();
+        if (ripples.length > 0) {
+          ctx.lineWidth = 1;
+          for (let i = ripples.length - 1; i >= 0; i--) {
+            const rip = ripples[i];
+            rip.r += 12 * dt;
+            rip.opacity -= 0.75 * dt;
+            if (rip.opacity <= 0 || rip.r >= rip.maxR) { ripples.splice(i, 1); continue; }
+            ctx.beginPath();
+            ctx.ellipse(rip.x, rip.y, rip.r * 1.5, rip.r * 0.75, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = `rgba(224,242,254,${Math.max(0, rip.opacity)})`;
+            ctx.stroke();
+          }
         }
 
         // Subtle wet-road vignette (single fillRect — very cheap)
@@ -251,10 +276,11 @@ export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
       animId = requestAnimationFrame(render);
     };
 
-    animId = requestAnimationFrame(render);
+    startLoop();
 
     return () => {
-      cancelAnimationFrame(animId);
+      if (animId) cancelAnimationFrame(animId);
+      wakeUpRef.current = null;
       resizeObserver.disconnect();
     };
   // Run once — mode changes are handled via modeRef, not by restarting the loop
