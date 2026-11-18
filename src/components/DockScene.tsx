@@ -491,12 +491,9 @@ export const DockScene = React.memo<DockSceneProps>(({
     [docks, onCallTruckToDock]
   );
 
-  // RAF loop for trucks — physics runs at full 60fps, React re-render throttled to ~30fps when moving
+  // RAF loop for trucks — runs at native 60fps requestAnimationFrame, completely decoupled from polling
   useEffect(() => {
     let active = true;
-    let lastReactRender = 0;
-    const REACT_FPS = 30; // 30fps is very smooth and keeps CPU usage low
-    const REACT_INTERVAL = 1000 / REACT_FPS;
     let wasMoving = false;
 
     const frameStep = (now: number) => {
@@ -539,15 +536,11 @@ export const DockScene = React.memo<DockSceneProps>(({
         }
       });
 
-      // ONLY trigger React re-render when a vehicle is moving (throttled to 30fps),
-      // plus exactly ONE final render when movement stops to settle at the final pose.
-      // When vehicles are stationary, CPU/GPU load is 0%.
+      // Pure 60fps rendering: when vehicles move, update at full 60fps monitor refresh rate.
+      // When vehicles stop, fire exactly ONE final render to settle at final pose, then remain idle at 0% CPU.
       if (anyMoving) {
         wasMoving = true;
-        if (now - lastReactRender >= REACT_INTERVAL) {
-          lastReactRender = now;
-          setRenderTrigger((prev) => prev + 1);
-        }
+        setRenderTrigger((prev) => prev + 1);
       } else if (wasMoving) {
         wasMoving = false;
         setRenderTrigger((prev) => prev + 1);
@@ -1073,7 +1066,7 @@ export const DockScene = React.memo<DockSceneProps>(({
               key={id}
               style={{ opacity }}
               filter={isSelected ? 'url(#selectedGlow)' : undefined}
-              className="cursor-pointer transition-opacity"
+              className="cursor-pointer"
               onClick={(e) => {
                 e.stopPropagation();
                 if (mode === 'waiting') {

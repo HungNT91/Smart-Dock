@@ -652,7 +652,7 @@ export function loadStoredData(): {
     sheetId: '1hfTZphz6FO8lIY8SMum94zgIx_WhEpwg5Oz4DFAGbwk',
     sheetName: 'Thông Tin Giao Hàng',
     autoSync: true,
-    pollIntervalSec: 3,
+    pollIntervalSec: 2,
     lastSyncedAt: new Date(),
     syncStatus: 'idle',
   };
@@ -693,7 +693,7 @@ export function loadStoredData(): {
       if (storedConfig) {
         const parsed = JSON.parse(storedConfig);
         // Merge stored config but preserve the new default sheetUrl/sheetId if not set
-        config = { ...config, ...parsed, pollIntervalSec: 3 };
+        config = { ...config, ...parsed, pollIntervalSec: 2 };
         // Normalize mode: if user explicitly chose 'simulator', keep it;
         // if localStorage has a gasWebAppUrl AND mode=gas_live, keep gas_live;
         // otherwise always fall back to sheet_direct with the configured sheetUrl.

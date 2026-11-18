@@ -43,7 +43,7 @@ interface MistPuff {
   baseOpacity: number;
 }
 
-export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
+export const WeatherOverlay = React.memo<WeatherOverlayProps>(({ mode }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // Keep mode in a ref and trigger wake-up if transitioning from clear
   const modeRef = useRef<WeatherMode>(mode);
@@ -293,4 +293,6 @@ export const WeatherOverlay: React.FC<WeatherOverlayProps> = ({ mode }) => {
       className="absolute inset-0 pointer-events-none z-10 w-full h-full"
     />
   );
-};
+});
+
+WeatherOverlay.displayName = 'WeatherOverlay';
