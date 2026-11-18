@@ -185,6 +185,7 @@ export const DockScene: React.FC<DockSceneProps> = ({
             vMap.set(truck.id, existing);
           }
           if (existing.assignedDockIndex !== dock.index) {
+            // Dock changed mid-animation — restart from gate
             const routePts = buildGateToDock(existing.truck.type, dock.cx, 0);
             existing.pose = { x: 1060, y: LANE_Y, th: Math.PI };
             existing.trajectory = routePts;
@@ -197,6 +198,7 @@ export const DockScene: React.FC<DockSceneProps> = ({
               existing.pose = dockedPose;
             };
           }
+          // ✅ Do NOT touch trajectory/trajStartTime if dock hasn't changed
           existing.truck = truck;
         } else if (existing.mode === 'docked') {
           if (existing.id !== truck.id) {
@@ -468,16 +470,22 @@ export const DockScene: React.FC<DockSceneProps> = ({
     [docks, onCallTruckToDock]
   );
 
-  // RAF loop for trucks
+  // RAF loop for trucks — physics runs at full 60fps, React re-render throttled to ~20fps
   useEffect(() => {
     let active = true;
+    let lastReactRender = 0;
+    const REACT_FPS = 20; // ms between React re-renders
+    const REACT_INTERVAL = 1000 / REACT_FPS;
 
     const frameStep = (now: number) => {
       if (!active) return;
 
       const vMap = vehiclesRef.current;
+      let anyMoving = false;
+
       vMap.forEach((v) => {
         if (v.trajectory && v.trajStartTime !== null) {
+          anyMoving = true;
           const elapsedSec = (now - v.trajStartTime) / 1000;
           const pts = v.trajectory;
           const totalDuration = pts[pts.length - 1].t;
@@ -509,7 +517,15 @@ export const DockScene: React.FC<DockSceneProps> = ({
         }
       });
 
-      setRenderTrigger((prev) => prev + 1);
+      // Only trigger React re-render at ~20fps, or immediately when animation finishes
+      if (anyMoving && now - lastReactRender >= REACT_INTERVAL) {
+        lastReactRender = now;
+        setRenderTrigger((prev) => prev + 1);
+      } else if (!anyMoving) {
+        // No vehicles moving — still need one final render after finish
+        setRenderTrigger((prev) => prev + 1);
+      }
+
       rafIdRef.current = requestAnimationFrame(frameStep);
     };
 
