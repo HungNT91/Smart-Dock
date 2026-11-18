@@ -112,10 +112,28 @@ export const DockScene: React.FC<DockSceneProps> = ({
         const L = cfg.lengthBody + cfg.lengthCab;
         const dockedPose = { x: dock.cx, y: 8 + L / 2, th: Math.PI / 2 };
 
+        // Kiểm tra nếu dock này đang có xe cũ đậu trước đó (ví dụ xe từ Lịch sử giao hàng)
+        // thì kích hoạt cho xe cũ lùi ra khỏi dock và rời kho, xe mới sẽ có độ trễ nhẹ 1.2s để lùi vào
+        const oldVehicleAtDock = Array.from(vMap.values()).find(
+          (v) => v.assignedDockIndex === dock.index && v.id !== truck.id && v.mode !== 'leaving_dock'
+        );
+        if (oldVehicleAtDock && (truck.status === 'moving' || (existing && existing.mode === 'waiting'))) {
+          const leavePts = buildLeaveDock(oldVehicleAtDock.truck.type, oldVehicleAtDock.pose);
+          oldVehicleAtDock.trajectory = leavePts;
+          oldVehicleAtDock.trajStartTime = performance.now();
+          oldVehicleAtDock.mode = 'leaving_dock';
+          oldVehicleAtDock.hazardBlinking = false;
+          oldVehicleAtDock.assignedDockIndex = undefined;
+          oldVehicleAtDock.onFinish = () => {
+            vMap.delete(oldVehicleAtDock.id);
+          };
+        }
+        const delaySec = oldVehicleAtDock ? 1.2 : 0;
+
         if (!existing) {
           if (truck.status === 'moving') {
-            // Newly called from outside / sheet "Ưu Tiên" -> drive in from warehouse gate into the dock
-            const gateRoutePts = buildGateToDock(truck.type, dock.cx, 0);
+            // Xe mới được gọi từ sheet "Ưu Tiên" hoặc bên ngoài -> chạy từ cổng kho lùi vào dock
+            const gateRoutePts = buildGateToDock(truck.type, dock.cx, delaySec);
             const activeVehicle: ActiveTruckState = {
               id: truck.id,
               truck,
@@ -148,15 +166,16 @@ export const DockScene: React.FC<DockSceneProps> = ({
             });
           }
         } else if (existing.mode === 'waiting' || existing.mode === 'entering_queue') {
+          // Xe đang ở hàng chờ -> chạy ra khỏi hàng chờ và lùi vào dock
           const useGate = existing.mode === 'entering_queue' || existing.pose.y <= LANE_Y + 45;
           const routePts = useGate
-            ? buildGateToDock(existing.truck.type, dock.cx, 0)
+            ? buildGateToDock(existing.truck.type, dock.cx, delaySec)
             : buildRouteToDock(
                 existing.truck.type,
                 existing.pose.x,
                 existing.pose.y,
                 dock.cx,
-                0
+                delaySec
               );
           if (existing.id !== truck.id) {
             vMap.delete(existing.id);

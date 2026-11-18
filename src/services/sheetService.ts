@@ -760,6 +760,22 @@ export function loadStoredData(): {
         }
       }
     });
+
+    // Nạp xe đang giao hàng từ sheet Lịch sử giao hàng (15 dòng từ dưới lên, bù dòng trên nếu trùng dock)
+    const queuePlates = new Set(
+      [...trucks, ...priorityTrucks]
+        .filter((t) => !t.assignedDock)
+        .map((t) => t.plate.trim().toUpperCase())
+    );
+    const histDockMap = extractDockTrucksFromHistory(history, queuePlates, now, 21);
+    histDockMap.forEach((histTruck, dockIndex) => {
+      const d = dockMap.get(dockIndex);
+      if (d && !d.currentTruck && d.status !== 'maintenance') {
+        d.currentTruck = histTruck;
+        d.status = 'busy';
+        d.since = histTruck.since || Date.now();
+      }
+    });
   }
 
   return {
@@ -935,24 +951,21 @@ function parseGvizTableToTrucks(table: any, isPrioritySheet: boolean): Truck[] {
   const cols = table.cols || [];
   const rows = table.rows || [];
 
-  // Build column names from table.cols labels; supplement with row-0 header if cols labels are empty
-  let headerRowIndex = -1;
-  const colNames: string[] = cols.map((c: any) => String(c?.label || '').trim());
+  let colNames: string[] = cols.map((c: any) => String(c?.label || '').trim());
+  const colsHaveLabels = colNames.some((name) => name.length > 0);
 
-  if (rows.length > 0) {
+  // In Google Sheets gviz API, row 1 headers are populated into table.cols[].label,
+  // which means table.rows[0] is row 2 of the spreadsheet.
+  // ONLY if table.cols completely lacks labels do we treat rows[0] as a header.
+  let dataRows = rows;
+  let headerRowOffset = 2; // rows[0] is sheet row 2
+  if (!colsHaveLabels && rows.length > 0) {
     const firstRowValues = (rows[0].c || []).map((cell: any) =>
-      String(cell?.v || '').trim().toLowerCase()
+      String(cell?.v || '').trim()
     );
-    const hasHeaderKeywords = firstRowValues.some((v: string) =>
-      v.includes('biển') || v.includes('xe') || v.includes('cửa') ||
-      v.includes('dock') || v.includes('thời gian') || v.includes('time')
-    );
-    if (hasHeaderKeywords) {
-      headerRowIndex = 0;
-      for (let i = 0; i < firstRowValues.length; i++) {
-        if (!colNames[i]) colNames[i] = firstRowValues[i];
-      }
-    }
+    colNames = firstRowValues;
+    dataRows = rows.slice(1);
+    headerRowOffset = 3;
   }
 
   const findCol = (pattern: RegExp, defaultIdx: number): number => {
@@ -969,8 +982,6 @@ function parseGvizTableToTrucks(table: any, isPrioritySheet: boolean): Truck[] {
   const idxPriority  = findCol(/ưu tiên|uu tien|priority/, 6);
   const idxCarCount  = findCol(/sl|số lượng|so luong|pallet/, 7);
   const idxPosition  = findCol(/vị trí|vi tri|position/, 8);
-
-  const dataRows = headerRowIndex === 0 ? rows.slice(1) : rows;
 
   const getVal = (c: any[], idx: number): string => {
     if (!c[idx] || c[idx].v === null || c[idx].v === undefined) return '';
@@ -1027,7 +1038,7 @@ function parseGvizTableToTrucks(table: any, isPrioritySheet: boolean): Truck[] {
       priority: priority || (isPrio ? 'Ưu tiên' : ''),
       carCount,
       waitingPosition,
-      sheetRowIndex: headerRowIndex === 0 ? rowIdx + 2 : rowIdx + 1,
+      sheetRowIndex: rowIdx + headerRowOffset,
       sourceSheet: isPrio ? 'priority' : 'active',
     });
   });
@@ -1106,6 +1117,7 @@ export async function fetchFromGoogleSheetUrl(
  */
 function parseGvizTableToHistory(table: any): HistoryRowData[] {
   const hCols = (table.cols || []).map((c: any) => String(c?.label || '').trim().toLowerCase());
+  const colsHaveLabels = hCols.some((n: string) => n.length > 0);
   const hRows = (table.rows || []) as any[];
 
   const findH = (pattern: RegExp, def: number): number => {
@@ -1124,15 +1136,11 @@ function parseGvizTableToHistory(table: any): HistoryRowData[] {
   const hIdxCar    = findH(/sl|số lượng|so luong|pallet/, 8);
   const hIdxPos    = findH(/vị trí|vi tri|position/, 9);
 
-  // Skip header row if the first data row contains label keywords
+  // If cols already contain headers from row 1, rows[0] is row 2 of spreadsheet.
+  // Only skip row 0 if cols have no labels.
   let startIdx = 0;
-  if (hRows.length > 0) {
-    const first = (hRows[0].c || []).map((cell: any) => String(cell?.v || '').toLowerCase());
-    if (first.some((v: string) =>
-      v.includes('biển') || v.includes('xe') || v.includes('cửa') || v.includes('dock')
-    )) {
-      startIdx = 1;
-    }
+  if (!colsHaveLabels && hRows.length > 0) {
+    startIdx = 1;
   }
 
   const getCellVal = (row: any, idx: number): string => {
@@ -1163,6 +1171,71 @@ function parseGvizTableToHistory(table: any): HistoryRowData[] {
       waitingPosition: getCellVal(row, hIdxPos) || '15m',
     }))
     .filter((h: HistoryRowData) => Boolean(h.plate));
+}
+
+/**
+ * Lấy danh sách xe đang ở dock từ sheet "Lịch sử giao hàng":
+ * - Lấy 15 dòng từ dưới lên (các dòng mới nhất ở cuối sheet).
+ * - Nếu trong 15 dòng đó có trùng cửa giao hàng: lấy dòng mới nhất (dòng ở dưới hơn)
+ *   và tự động lấy bù thêm các dòng ở trên cho đủ tối đa 15 dòng (15 cửa khác nhau).
+ * - Đảm bảo các dock hiển thị đúng xe đang giao hàng.
+ * - Chỉ không hiển thị khi đến 21:00 hàng ngày.
+ */
+export function extractDockTrucksFromHistory(
+  history: HistoryRowData[],
+  activeQueuePlates: Set<string> = new Set(),
+  now: Date = new Date(),
+  cutoffHour = 21
+): Map<number, Truck> {
+  const dockMap = new Map<number, Truck>();
+
+  // Sau 21:00 hàng ngày, dock được giải phóng sạch
+  if (now.getHours() >= cutoffHour) {
+    return dockMap;
+  }
+
+  // Duyệt từ dưới lên (từ dòng cuối cùng của sheet Lịch sử giao hàng ngược lên đầu)
+  // Lấy tối đa 15 dòng (15 cửa khác nhau). Nếu trùng cửa, tự động duyệt tiếp lên trên để bù đủ 15 dòng.
+  for (let i = history.length - 1; i >= 0 && dockMap.size < 15; i--) {
+    const h = history[i];
+    if (!h.plate || !h.dock) continue;
+
+    const dockIndex = findDockIndexById(h.dock);
+    if (dockIndex === null) continue;
+
+    const normPlate = h.plate.trim().toUpperCase();
+    // Nếu xe này đang nằm trong hàng đợi của Thông Tin Giao Hàng hoặc Ưu Tiên thì ưu tiên hàng đợi
+    if (activeQueuePlates.has(normPlate)) continue;
+
+    // Nếu dock này đã có xe ở dòng mới hơn bên dưới -> bỏ qua, vòng lặp tự động lấy dòng phía trên bù vào
+    if (dockMap.has(dockIndex)) continue;
+
+    const dockDef = DOCK_DEFINITIONS[dockIndex];
+    const parsedTs = (parseSheetDateTime(h.inTime) || parseSheetDateTime(h.timestamp))?.getTime() || Date.now();
+
+    dockMap.set(dockIndex, {
+      id: `HIST-${normPlate}-${dockIndex}`,
+      plate: normPlate,
+      type: mapTypeNameToKey(h.vehicleType),
+      supplier: h.notes || 'Đang giao hàng',
+      pallets: Number(h.carCount) * 5 || 10,
+      assignedDock: dockDef ? dockDef.id : h.dock,
+      dockId: dockIndex,
+      checkInTime: h.inTime || '',
+      arrivalTimeMs: parsedTs,
+      status: 'busy',
+      since: parsedTs,
+      notes: h.notes || 'ĐÃ GIAO HÀNG',
+      timestamp: h.timestamp || '',
+      callCount: Number(h.callCount) || 1,
+      priority: h.priority || '',
+      carCount: Number(h.carCount) || 1,
+      waitingPosition: h.waitingPosition || '15m',
+      sourceSheet: 'active',
+    });
+  }
+
+  return dockMap;
 }
 
 /**

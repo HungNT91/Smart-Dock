@@ -22,6 +22,7 @@ import {
   getStoredSessionDate,
   setStoredSessionDate,
   DismissedCallEntry,
+  extractDockTrucksFromHistory,
 } from './services/sheetService';
 import { VEHICLE_CONFIGS, mapTypeNameToKey } from './utils/isoMath';
 import { speakAnnouncement, cancelAnnouncement } from './utils/audioAnnouncement';
@@ -602,9 +603,19 @@ export default function App() {
           );
         };
 
-        // Re-map docks cleanly from active sheets (Thông Tin Giao Hàng & Ưu Tiên).
-        // Free docks remain free so departing trucks play their exit animation
-        // and arriving trucks play their entry animation.
+        const queuePlates = new Set(
+          [...liveTrucks, ...livePriorityTrucks]
+            .filter((t) => !t.assignedDock)
+            .map((t) => t.plate.trim().toUpperCase())
+        );
+
+        // Lấy 15 dòng từ dưới lên của Lịch sử giao hàng (nếu trùng dock thì lấy dòng mới nhất và lấy bù thêm dòng trên cho đủ 15 dòng, trước 21:00)
+        const histDockMap = extractDockTrucksFromHistory(liveHistory, queuePlates, now, 21);
+
+        // Re-map docks:
+        // 1. Ưu tiên xe được gọi trực tiếp từ sheet "Thông Tin Giao Hàng" và "Ưu Tiên".
+        // 2. Với các dock còn lại: nạp xe đang giao hàng lấy từ sheet "Lịch sử giao hàng" (15 dòng từ dưới lên).
+        // 3. Nếu không có xe nào: dock trống.
         setDocks((prevDocks) => {
           return prevDocks.map((d) => {
             const prioMatch = livePriorityTrucks.find(
@@ -629,7 +640,17 @@ export default function App() {
               };
             }
 
-            // No active truck assigned to this dock -> dock is free!
+            // Nếu dock không có xe active từ 2 sheet trên, lấy xe đang giao hàng từ sheet Lịch sử giao hàng
+            const histTruck = histDockMap.get(d.index);
+            if (histTruck && d.status !== 'maintenance') {
+              return {
+                ...d,
+                currentTruck: histTruck,
+                status: 'busy',
+              };
+            }
+
+            // Không có xe nào -> dock trống!
             return {
               ...d,
               currentTruck: null,
