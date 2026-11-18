@@ -28,6 +28,8 @@ async function startServer() {
           extractedSheetId = sheetMatch[1];
           const queryParams = new URLSearchParams({ tqx: 'out:json' });
           if (sheetName) queryParams.set('sheet', sheetName);
+          const tq = (req.query.tq as string) || (req.body && req.body.tq);
+          if (tq) queryParams.set('tq', tq);
           targetUrl = `https://docs.google.com/spreadsheets/d/${extractedSheetId}/gviz/tq?${queryParams.toString()}`;
         }
       } else {

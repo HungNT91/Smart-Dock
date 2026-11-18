@@ -402,20 +402,21 @@ export default function App() {
         });
       };
 
-      // Detect trucks that just moved into "Lịch sử giao hàng"
+      // Detect trucks that just moved into "Lịch sử giao hàng" (O(N) with Set lookup)
       const newlyConfirmedPlates = new Set<string>();
       if (!isInitialSync) {
+        const prevHistKeys = new Set(
+          prevHistory.map(
+            (ph) =>
+              `${String(ph.plate || '').trim().toUpperCase()}_${String(ph.inTime || '').trim()}_${String(ph.dock || '').trim().toUpperCase()}_${String(ph.timestamp || '').trim()}`
+          )
+        );
+
         liveHistory.forEach((h) => {
           const plateKey = String(h.plate || '').trim().toUpperCase();
           if (!plateKey) return;
-          const existedBefore = prevHistory.some(
-            (ph) =>
-              String(ph.plate || '').trim().toUpperCase() === plateKey &&
-              String(ph.inTime || '').trim() === String(h.inTime || '').trim() &&
-              String(ph.dock || '').trim().toUpperCase() === String(h.dock || '').trim().toUpperCase() &&
-              String(ph.timestamp || '').trim() === String(h.timestamp || '').trim()
-          );
-          if (!existedBefore) {
+          const key = `${plateKey}_${String(h.inTime || '').trim()}_${String(h.dock || '').trim().toUpperCase()}_${String(h.timestamp || '').trim()}`;
+          if (!prevHistKeys.has(key)) {
             newlyConfirmedPlates.add(plateKey);
           }
         });
@@ -581,11 +582,14 @@ export default function App() {
           return !p || p.plate !== t.plate || p.assignedDock !== t.assignedDock || p.callCount !== t.callCount;
         });
 
+      const lastLiveHist = res.history && res.history.length > 0 ? res.history[res.history.length - 1] : null;
+      const lastPrevHist = prevHistory && prevHistory.length > 0 ? prevHistory[prevHistory.length - 1] : null;
       const historyChanged =
         Boolean(res.history && res.history.length > 0) &&
         (res.history.length !== prevHistory.length ||
-          res.history[0]?.plate !== prevHistory[0]?.plate ||
-          res.history[0]?.inTime !== prevHistory[0]?.inTime);
+          lastLiveHist?.plate !== lastPrevHist?.plate ||
+          lastLiveHist?.inTime !== lastPrevHist?.inTime ||
+          lastLiveHist?.timestamp !== lastPrevHist?.timestamp);
 
       const hasStructuralChange =
         trucksChanged ||
