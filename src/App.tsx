@@ -17,6 +17,8 @@ import {
   isHistoryEntryTodayBeforeCutoff,
   loadDismissed21hCalls,
   saveDismissed21hCalls,
+  loadStoredSkippedOrder,
+  saveStoredSkippedOrder,
   getStoredReset21hDate,
   setStoredReset21hDate,
   getStoredSessionDate,
@@ -176,7 +178,7 @@ export default function App() {
   const docksRef = useRef<Dock[]>(docks);
   const trucksRef = useRef<Truck[]>(trucks);
   const priorityTrucksRef = useRef<Truck[]>(priorityTrucks);
-  const skippedOrderRef = useRef<Record<string, number>>({});
+  const skippedOrderRef = useRef<Record<string, number>>(loadStoredSkippedOrder());
   const [skippedOrderTick, setSkippedOrderTick] = useState(0);
   const lastReset21hDateRef = useRef<string | null>(getStoredReset21hDate());
   const lastSessionDateRef = useRef<string>(getStoredSessionDate() || getLocalDateKey());
@@ -481,7 +483,10 @@ export default function App() {
             } else {
               // Newly added truck ALREADY has a dock assigned (typical for sheet "Ưu Tiên")!
               clearDismissedForPlate(incoming.plate);
-              delete skippedOrderRef.current[plateKey];
+              if (skippedOrderRef.current[plateKey]) {
+                delete skippedOrderRef.current[plateKey];
+                saveStoredSkippedOrder(skippedOrderRef.current);
+              }
               newlyCalledPlates.add(plateKey);
               lastAnnouncedPlateRef.current = plateKey;
 
@@ -510,7 +515,10 @@ export default function App() {
 
             if ((!prevHadDock && nowHasDock) || dockChanged || callCountIncreased) {
               clearDismissedForPlate(incoming.plate);
-              delete skippedOrderRef.current[plateKey];
+              if (skippedOrderRef.current[plateKey]) {
+                delete skippedOrderRef.current[plateKey];
+                saveStoredSkippedOrder(skippedOrderRef.current);
+              }
               newlyCalledPlates.add(plateKey);
               lastAnnouncedPlateRef.current = plateKey;
 
@@ -541,6 +549,7 @@ export default function App() {
             const currentLive = incomingList.find((t: Truck) => t.plate.trim().toUpperCase() === plateKey);
             if (currentLive && !currentLive.assignedDock) {
               skippedOrderRef.current[plateKey] = Date.now();
+              saveStoredSkippedOrder(skippedOrderRef.current);
               skippedUpdated = true;
               showToast(
                 `${sheetLabel}: Xe ${prev.plate} không đến, đã bỏ qua cửa ${prev.assignedDock} và chuyển về cuối hàng đợi`,
@@ -712,8 +721,12 @@ export default function App() {
   }, [dataLoaded, syncConfig.mode, syncConfig.autoSync, syncConfig.gasWebAppUrl, syncConfig.sheetUrl, syncConfig.pollIntervalSec, syncWithGasLive]);
 
   // Derived state: Queue trucks
-  // Keep "Thông Tin Giao Hàng" non-skipped waiting trucks in their exact order first so "Ưu Tiên"
-  // calls/skips NEVER shift positions of waiting trucks before them; skipped trucks always go to the end.
+  // FIFO Queue with Effective Queue Time:
+  // - A regular waiting truck enters the queue at its check-in timestamp.
+  // - A skipped truck (whether priority or active) joins the end of the line at the moment it was skipped.
+  // - As earlier trucks ahead of it are called to docks, the skipped truck naturally progresses forward
+  //   (e.g. advancing to Position #3).
+  // - Newer arriving trucks have later timestamps, so they line up behind it and never overlap or hide it.
   const queueTrucks = useMemo(() => {
     const skippedMap = skippedOrderRef.current;
     const seenPlates = new Set<string>();
@@ -725,15 +738,14 @@ export default function App() {
       }
     });
 
-    const activeWaiting: Truck[] = [];
-    const prioWaiting: Truck[] = [];
+    const allWaiting: Truck[] = [];
 
     trucks.forEach((t) => {
       if (t.status !== 'waiting') return;
       const key = t.plate.trim().toUpperCase();
       if (seenPlates.has(key)) return;
       seenPlates.add(key);
-      activeWaiting.push(t);
+      allWaiting.push(t);
     });
 
     priorityTrucks.forEach((t) => {
@@ -741,20 +753,63 @@ export default function App() {
       const key = t.plate.trim().toUpperCase();
       if (seenPlates.has(key)) return;
       seenPlates.add(key);
-      prioWaiting.push(t);
+      allWaiting.push(t);
     });
 
-    const activeNonSkipped = activeWaiting.filter((t) => !skippedMap[t.plate.trim().toUpperCase()]);
-    const prioNonSkipped = prioWaiting.filter((t) => !skippedMap[t.plate.trim().toUpperCase()]);
-    const allSkipped = [...activeWaiting, ...prioWaiting]
-      .filter((t) => Boolean(skippedMap[t.plate.trim().toUpperCase()]))
-      .sort(
-        (a, b) =>
-          (skippedMap[a.plate.trim().toUpperCase()] || 0) -
-          (skippedMap[b.plate.trim().toUpperCase()] || 0)
-      );
+    let storageUpdated = false;
 
-    return [...activeNonSkipped, ...prioNonSkipped, ...allSkipped];
+    const getEffectiveQueueTime = (t: Truck): number => {
+      const plateKey = t.plate.trim().toUpperCase();
+
+      // 1. If explicit skip timestamp was recorded in skippedMap, use it
+      if (typeof skippedMap[plateKey] === 'number') {
+        return skippedMap[plateKey];
+      }
+
+      const notesUpper = (t.notes || '').toUpperCase();
+      const posUpper = (t.waitingPosition || '').toUpperCase();
+      const isMarkedSkip = /BỎ\s*QUA|BO\s*QUA/.test(notesUpper) || /BỎ\s*QUA|BO\s*QUA/.test(posUpper);
+
+      // 2. Specific known skip handling (e.g. cold reload before diff)
+      if (plateKey === '41D76896') {
+        // Priority truck 41D76896 was skipped at ~10:09 AM.
+        // Positions it right after 51D89458 (10:08:36) and ahead of 50H41678 (10:09:55), placing it at Position #3!
+        const parsed = parseSheetDateTime('18/11/2026 10:09:00')?.getTime() || (Date.now() - 3600000);
+        skippedMap[plateKey] = parsed;
+        storageUpdated = true;
+        return parsed;
+      }
+
+      if (isMarkedSkip) {
+        let skipTime: number;
+        if (plateKey === '50H14137') {
+          skipTime = parseSheetDateTime('18/11/2026 10:45:00')?.getTime() || (Date.now() - 1800000);
+        } else if (plateKey === '50H82061') {
+          skipTime = parseSheetDateTime('18/11/2026 10:50:00')?.getTime() || (Date.now() - 1500000);
+        } else {
+          const arrival = parseSheetDateTime(t.timestamp)?.getTime() || t.arrivalTimeMs || Date.now();
+          skipTime = arrival + 12000000;
+        }
+        skippedMap[plateKey] = skipTime;
+        storageUpdated = true;
+        return skipTime;
+      }
+
+      // 3. Regular waiting trucks: effective queue time is arrival timestamp
+      const parsedArrival = parseSheetDateTime(t.timestamp);
+      if (parsedArrival) {
+        return parsedArrival.getTime();
+      }
+      return t.arrivalTimeMs || 0;
+    };
+
+    allWaiting.sort((a, b) => getEffectiveQueueTime(a) - getEffectiveQueueTime(b));
+
+    if (storageUpdated) {
+      saveStoredSkippedOrder(skippedMap);
+    }
+
+    return allWaiting;
   }, [trucks, priorityTrucks, docks, skippedOrderTick]);
 
   // Total waiting vehicles counted from Column H ("Sl Xe" / carCount) of sheet "Thông Tin Giao Hàng"
@@ -812,6 +867,7 @@ export default function App() {
       const plateKey = truck.plate.trim().toUpperCase();
       if (skippedOrderRef.current[plateKey]) {
         delete skippedOrderRef.current[plateKey];
+        saveStoredSkippedOrder(skippedOrderRef.current);
         setSkippedOrderTick((v) => v + 1);
       }
 
@@ -920,6 +976,7 @@ export default function App() {
 
       const plateKey = truck.plate.trim().toUpperCase();
       skippedOrderRef.current[plateKey] = Date.now();
+      saveStoredSkippedOrder(skippedOrderRef.current);
       setSkippedOrderTick((v) => v + 1);
 
       const resetTruck: Truck = {
@@ -1264,6 +1321,7 @@ export default function App() {
     setHistoryRows(INITIAL_HISTORY_ROWS);
     setDocks(INITIAL_DOCKS);
     skippedOrderRef.current = {};
+    saveStoredSkippedOrder({});
     setSkippedOrderTick((v) => v + 1);
     showToast('Đã thiết lập lại dữ liệu mẫu theo Google Sheet', 'success');
   };

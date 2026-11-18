@@ -185,6 +185,29 @@ export function saveDismissed21hCalls(entries: DismissedCallEntry[]) {
   }
 }
 
+const STORAGE_KEY_SKIPPED = 'wms_skipped_order_v1';
+
+export function loadStoredSkippedOrder(): Record<string, number> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_SKIPPED);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveStoredSkippedOrder(map: Record<string, number>) {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(STORAGE_KEY_SKIPPED, JSON.stringify(map));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export const DOCK_DEFINITIONS: { id: string; group: 'A' | 'B' }[] = [
   // Cửa A1 đến A12 (12 cửa)
   { id: 'A1', group: 'A' },
